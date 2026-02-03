@@ -62,6 +62,37 @@ Web UI 使用 **HTTP Basic Auth**（浏览器会弹出登录框）：
 
 ---
 
+## 1.1.1 Token 统计（/v1/metrics/tokens/*）
+
+用途：在“Token 统计”页查看每次调用的 Token、每日用量趋势，并支持按上游/Provider 分组查看。
+
+前置开关（任一满足即可）：
+- `WEB_UI_ENABLED=true`（启用 Web UI 时会自动启用统计）
+- 或 `RSP4COPILOT_TOKEN_STATS_ENABLED=true`（不启用 Web UI 也可单独启用统计接口）
+
+相关接口：
+- `GET /v1/metrics/tokens/overview?days=30&groupBy=upstream`
+- `GET /v1/metrics/tokens/recent?since=0&limit=200`
+
+> 说明：当前实现为内存统计，服务重启会清空历史数据。
+
+## 1.1.2 上游可用率（/v1/metrics/availability/*）
+
+用途：在“可用率”页查看上游调用成功率（可按 `provider/upstream`、`model` 或二者组合聚合），并展示每日趋势与最近请求。
+
+统计口径：
+- 以“上游尝试”为单位记录（包括失败切换/重试过程中的每一次尝试）
+- 成功：HTTP 2xx；失败：非 2xx
+
+前置开关（同 Token 统计）：
+- `WEB_UI_ENABLED=true` 或 `RSP4COPILOT_TOKEN_STATS_ENABLED=true`
+
+相关接口：
+- `GET /v1/metrics/availability/overview?days=30&groupBy=upstream_model`
+- `GET /v1/metrics/availability/recent?since=0&limit=200`
+
+> 说明：当前实现为内存统计，服务重启会清空历史数据。
+
 ## 1.2 服务端配置文件（Docker）
 
 这一块操作的是你容器内的配置文件 `RSP4COPILOT_CONFIG_FILE`（默认 `/config/rsp4copilot.config.jsonc`，在 compose 里挂载到宿主机 `./configs` 目录）。

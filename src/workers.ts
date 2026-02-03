@@ -43,6 +43,7 @@ import { openAIChatResponseToResponses, responsesRequestToOpenAIChat } from "./p
 import { openAIChatSseToGeminiSse, openAIChatSseToResponsesSse } from "./protocols/stream";
 import { listUpstreamCandidates, shouldTryNextUpstreamCandidateStatus } from "./upstreams";
 import { instrumentResponseAndRecordTokens, tokenEstimates, tokenMetrics, tokenMetricsErrorResponse } from "./metrics";
+import { availabilityMetrics, availabilityMetricsErrorResponse } from "./availability";
 
 function getCorsHeaders(request: Request): Record<string, string> {
   const origin = request.headers.get("origin") || "";
@@ -581,6 +582,7 @@ function webUiHtml(): string {
 	      <nav class="nav-tabs" id="navTabs">
 	        <button class="nav-tab active" data-tab="dashboard">概览</button>
 	        <button class="nav-tab" data-tab="tokens">Token 统计</button>
+	        <button class="nav-tab" data-tab="availability">可用率</button>
 	        <button class="nav-tab" data-tab="config">配置管理</button>
 	        <button class="nav-tab" data-tab="test">API 测试</button>
 	        <button class="nav-tab" data-tab="dist">分发测试</button>
@@ -719,6 +721,108 @@ function webUiHtml(): string {
                   <th>耗时</th>
                   <th>流式</th>
                   <th>状态</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Availability Tab -->
+    <div id="tab-availability" class="tab-content fade-in">
+      <div class="card">
+        <h1>✅ 上游可用率</h1>
+        <p class="muted">
+          统计上游调用的成功率（按 <code>provider/upstream</code> 与 <code>model</code> 聚合），并展示趋势与最近请求。<br>
+          <strong>提示：</strong>当前实现为内存统计（重启服务会清空）；通过 <code>WEB_UI_ENABLED=true</code> 或 <code>RSP4COPILOT_TOKEN_STATS_ENABLED=true</code> 启用。
+        </p>
+
+        <div class="mt-lg grid">
+          <div>
+            <label>时间范围</label>
+            <select id="availDays">
+              <option value="7">最近 7 天</option>
+              <option value="30" selected>最近 30 天</option>
+              <option value="90">最近 90 天</option>
+            </select>
+          </div>
+          <div>
+            <label>分组维度</label>
+            <select id="availGroupBy">
+              <option value="upstream_model" selected>按 上游 + 模型</option>
+              <option value="upstream">按 上游（provider/upstream）</option>
+              <option value="model">按 模型</option>
+              <option value="provider">按 Provider</option>
+            </select>
+          </div>
+          <div style="display:flex; align-items:flex-end">
+            <button class="primary" id="availRefresh" style="width:100%">🔄 刷新概览</button>
+          </div>
+          <div>
+            <label>实时刷新</label>
+            <div class="toggle-row">
+              <input type="checkbox" id="availAuto" checked />
+              <span class="muted">每 2 秒拉取最近请求</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="mt-lg token-layout">
+          <div class="token-col">
+            <div class="card token-card">
+              <h2>📉 每日可用率</h2>
+              <div class="token-kpis mt-md">
+                <div class="token-kpi">
+                  <div class="token-kpi-title">总体可用率</div>
+                  <div id="availRate" class="token-kpi-value">-</div>
+                  <div id="availRateSub" class="muted">请求 - | 错误 -</div>
+                </div>
+                <div class="token-kpi">
+                  <div class="token-kpi-title">平均耗时</div>
+                  <div id="availLatency" class="token-kpi-value">-</div>
+                  <div class="muted">按请求响应耗时（ms/s）</div>
+                </div>
+              </div>
+              <div class="token-chart-wrap mt-md">
+                <canvas id="availDailyChart"></canvas>
+              </div>
+              <div class="muted mt-sm" id="availOverviewHint"></div>
+            </div>
+          </div>
+          <div class="token-col">
+            <div class="card token-card">
+              <h2>🧩 分组概览</h2>
+              <div id="availGroups" class="mt-md"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="mt-lg card token-card">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+            <h2 style="margin:0;">🕒 最近请求（实时）</h2>
+            <div class="token-controls">
+              <input id="availSearch" placeholder="过滤：上游/模型/路径" style="min-width:240px; padding:10px 12px; border-radius:10px; border:1px solid var(--border); background: var(--bg); color: var(--text); outline:none;" />
+              <label class="muted" style="display:flex; align-items:center; gap:6px;">
+                <input type="checkbox" id="availOnlyErr" />
+                仅错误
+              </label>
+              <button id="availClear">清空显示</button>
+            </div>
+          </div>
+          <div class="muted mt-sm" id="availRecentStatus"></div>
+          <div class="token-table-wrap mt-md">
+            <table class="token-table" id="availRecentTable">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>上游</th>
+                  <th>模型</th>
+                  <th>耗时</th>
+                  <th>流式</th>
+                  <th>状态</th>
+                  <th>路径</th>
                 </tr>
               </thead>
               <tbody></tbody>
@@ -931,12 +1035,17 @@ function webUiHtml(): string {
           targetContent.classList.add('active', 'fade-in');
         }
 
-        // Token 统计页：进入时启动刷新/轮询，离开时停止轮询
+        // Token/可用率：进入时启动刷新/轮询，离开时停止轮询
         try {
           if (targetTab === 'tokens') {
             ensureTokensTab();
+            stopAvailPolling();
+          } else if (targetTab === 'availability') {
+            ensureAvailabilityTab();
+            stopTokPolling();
           } else {
             stopTokPolling();
+            stopAvailPolling();
           }
         } catch {}
       });
@@ -984,6 +1093,21 @@ function webUiHtml(): string {
 	    const tokRecentGroupFilterEl = document.getElementById('tokRecentGroupFilter');
 	    const tokRecentStreamFilterEl = document.getElementById('tokRecentStreamFilter');
 	    const tokClearEl = document.getElementById('tokClear');
+	    const availDaysEl = document.getElementById('availDays');
+	    const availGroupByEl = document.getElementById('availGroupBy');
+	    const availRefreshEl = document.getElementById('availRefresh');
+	    const availAutoEl = document.getElementById('availAuto');
+	    const availRateEl = document.getElementById('availRate');
+	    const availRateSubEl = document.getElementById('availRateSub');
+	    const availLatencyEl = document.getElementById('availLatency');
+	    const availDailyChartEl = document.getElementById('availDailyChart');
+	    const availGroupsEl = document.getElementById('availGroups');
+	    const availOverviewHintEl = document.getElementById('availOverviewHint');
+	    const availRecentTableEl = document.getElementById('availRecentTable');
+	    const availRecentStatusEl = document.getElementById('availRecentStatus');
+	    const availSearchEl = document.getElementById('availSearch');
+	    const availOnlyErrEl = document.getElementById('availOnlyErr');
+	    const availClearEl = document.getElementById('availClear');
 
     function setOut(text, isErr){
       outEl.className = isErr ? '' : '';
@@ -1101,6 +1225,13 @@ function webUiHtml(): string {
       const n = fmtInt(v);
       if (n >= 1000) return (n / 1000).toFixed(2) + 's';
       return n + 'ms';
+    }
+    function fmtPct01(v, digits){
+      const n = Number(v);
+      const d = Number.isFinite(Number(digits)) ? Math.max(0, Math.min(6, Math.floor(Number(digits)))) : 2;
+      if (!Number.isFinite(n)) return '-';
+      const x = Math.max(0, Math.min(1, n));
+      return (x * 100).toFixed(d) + '%';
     }
     function safeJson(text){
       try { return JSON.parse(String(text || '')); } catch { return null; }
@@ -1456,6 +1587,241 @@ function webUiHtml(): string {
         const labels = daysList.map(d => String(d && d.date ? d.date : ''));
         const values = daysList.map(d => fmtInt(d && d.totalTokens));
         drawLineChart(tokDailyChartEl, labels, values);
+      } catch {}
+    });
+
+    // =========================
+    // Availability stats (UI)
+    // =========================
+    function isAvailabilityTabActive(){
+      const el = document.getElementById('tab-availability');
+      return !!(el && el.classList.contains('active'));
+    }
+
+    function setAvailRecentStatus(text){
+      if (!availRecentStatusEl) return;
+      availRecentStatusEl.textContent = String(text || '');
+    }
+
+    let availSince = 0;
+    let availPollTimer = null;
+    let availOverviewCache = null;
+    let availRecentCache = [];
+
+    function renderAvailGroups(groups){
+      if (!availGroupsEl) return;
+      availGroupsEl.innerHTML = '';
+      const wrap = document.createElement('div');
+      wrap.className = 'token-groups';
+      const list = Array.isArray(groups) ? groups.slice(0, 10) : [];
+      if (!list.length){
+        const empty = document.createElement('div');
+        empty.className = 'muted';
+        empty.textContent = '暂无数据（等待产生调用记录后再刷新）';
+        availGroupsEl.appendChild(empty);
+        return;
+      }
+      for (const g of list){
+        const key = String(g && g.key ? g.key : '');
+        const reqs = fmtInt(g && g.requests);
+        const errs = fmtInt(g && g.error);
+        const rate = Number(g && g.okRate);
+        const pct = Math.max(0, Math.min(100, Math.round((Number.isFinite(rate) ? rate : 0) * 10000) / 100));
+        const avgMs = fmtInt(g && g.avgLatencyMs);
+
+        const card = document.createElement('div');
+        card.className = 'token-group';
+        const top = document.createElement('div');
+        top.className = 'token-group-top';
+        const left = document.createElement('div');
+        const name = document.createElement('div');
+        name.className = 'token-group-name';
+        name.textContent = key || '(unknown)';
+        const meta = document.createElement('div');
+        meta.className = 'token-group-meta';
+        meta.textContent = '可用率 ' + pct.toFixed(2) + '% · 请求 ' + reqs + ' · 错误 ' + errs + ' · 平均 ' + fmtMs(avgMs);
+        left.appendChild(name);
+        left.appendChild(meta);
+        const right = document.createElement('div');
+        right.className = 'token-group-meta';
+        right.textContent = pct.toFixed(2) + '%';
+        top.appendChild(left);
+        top.appendChild(right);
+
+        const bar = document.createElement('div');
+        bar.className = 'token-bar';
+        const fill = document.createElement('div');
+        fill.style.width = pct + '%';
+        bar.appendChild(fill);
+
+        card.appendChild(top);
+        card.appendChild(bar);
+        wrap.appendChild(card);
+      }
+      availGroupsEl.appendChild(wrap);
+    }
+
+    function renderAvailRecent(records){
+      const table = availRecentTableEl;
+      if (!table) return;
+      const tbody = table.querySelector('tbody');
+      if (!tbody) return;
+      tbody.innerHTML = '';
+
+      const onlyErr = !!(availOnlyErrEl && availOnlyErrEl.checked);
+      const q = availSearchEl ? String(availSearchEl.value || '').trim().toLowerCase() : '';
+      const list = Array.isArray(records) ? records : [];
+      const filtered = list.filter(r => {
+        if (onlyErr && String(r && r.status) !== 'error') return false;
+        if (!q) return true;
+        const providerId = String(r && r.providerId ? r.providerId : '').toLowerCase();
+        const upstreamId = String(r && r.upstreamId ? r.upstreamId : '').toLowerCase();
+        const model = String(r && r.model ? r.model : '').toLowerCase();
+        const path = String(r && r.path ? r.path : '').toLowerCase();
+        return providerId.includes(q) || upstreamId.includes(q) || model.includes(q) || path.includes(q);
+      }).slice(0, 200);
+
+      for (const r of filtered){
+        const tr = document.createElement('tr');
+        const ts = fmtInt(r && r.ts);
+        const timeStr = ts ? new Date(ts).toLocaleString('zh-CN', { hour12: false }) : '-';
+        const providerId = String(r && r.providerId ? r.providerId : '');
+        const upstreamId = String(r && r.upstreamId ? r.upstreamId : '');
+        const upstreamLabel = upstreamId && upstreamId !== providerId ? (providerId + '/' + upstreamId) : (providerId || upstreamId || '-');
+        const model = String(r && r.model ? r.model : '');
+        const latency = fmtMs(r && r.latencyMs);
+        const stream = String(Boolean(r && r.stream));
+        const st = String(r && r.status ? r.status : '');
+        const path = String(r && r.path ? r.path : '');
+
+        const td = (text) => {
+          const el = document.createElement('td');
+          el.textContent = text;
+          return el;
+        };
+
+        tr.appendChild(td(timeStr));
+        tr.appendChild(td(upstreamLabel));
+        tr.appendChild(td(model || '-'));
+        tr.appendChild(td(latency));
+        tr.appendChild(td(stream));
+        const tdStatus = document.createElement('td');
+        const badge = document.createElement('span');
+        badge.className = 'tok-badge ' + (st === 'ok' ? 'tok-ok' : 'tok-err');
+        badge.textContent = st === 'ok' ? 'OK' : 'ERR';
+        tdStatus.appendChild(badge);
+        tr.appendChild(tdStatus);
+        tr.appendChild(td(path || '-'));
+        tbody.appendChild(tr);
+      }
+    }
+
+    async function loadAvailOverview(){
+      if (!isAvailabilityTabActive()) return;
+      if (availOverviewHintEl) availOverviewHintEl.textContent = '加载中...';
+
+      const days = availDaysEl ? String(availDaysEl.value || '30') : '30';
+      const groupBy = availGroupByEl ? String(availGroupByEl.value || 'upstream_model') : 'upstream_model';
+      const r = await callGatewayJson('/v1/metrics/availability/overview?days=' + encodeURIComponent(days) + '&groupBy=' + encodeURIComponent(groupBy), { method: 'GET' });
+      if (r.status >= 400 || !r.json || r.json.ok !== true){
+        if (availOverviewHintEl) availOverviewHintEl.textContent = '加载失败：HTTP ' + r.status + '（请确认已启用可用率统计）';
+        return;
+      }
+
+      availOverviewCache = r.json;
+      const totals = (r.json && r.json.totals) ? r.json.totals : {};
+      const rate = Number(totals.okRate);
+      const reqs = fmtInt(totals.requests);
+      const errs = fmtInt(totals.error);
+      const avgMs = fmtInt(totals.avgLatencyMs);
+      if (availRateEl) availRateEl.textContent = fmtPct01(rate, 2);
+      if (availRateSubEl) availRateSubEl.textContent = '请求 ' + reqs + ' | 错误 ' + errs;
+      if (availLatencyEl) availLatencyEl.textContent = fmtMs(avgMs);
+
+      const daysList = Array.isArray(r.json.days) ? r.json.days : [];
+      const labels = daysList.map(d => String(d && d.date ? d.date : ''));
+      const values = daysList.map(d => {
+        const rr = Number(d && d.okRate);
+        return Math.max(0, Math.min(100, Math.round((Number.isFinite(rr) ? rr : 0) * 10000) / 100));
+      });
+      drawLineChart(availDailyChartEl, labels, values);
+      renderAvailGroups(r.json.groups);
+      if (availOverviewHintEl) {
+        availOverviewHintEl.textContent = '范围 ' + String(r.json.from || '') + ' ~ ' + String(r.json.to || '') + ' · 分组 ' + groupBy;
+      }
+    }
+
+    async function pollAvailRecentOnce(){
+      if (!isAvailabilityTabActive()) return;
+      if (availAutoEl && !availAutoEl.checked) return;
+
+      const qs = new URLSearchParams();
+      qs.set('since', String(availSince || 0));
+      qs.set('limit', '200');
+      const r = await callGatewayJson('/v1/metrics/availability/recent?' + qs.toString(), { method: 'GET' });
+      if (r.status >= 400 || !r.json || r.json.ok !== true){
+        setAvailRecentStatus('拉取失败：HTTP ' + r.status + '（请确认已启用可用率统计，并确保入口 Key/代理可用）');
+        return;
+      }
+
+      const nextSince = fmtInt(r.json.nextSince);
+      const incoming = Array.isArray(r.json.records) ? r.json.records : [];
+      if (nextSince) availSince = Math.max(availSince, nextSince);
+
+      const merged = incoming.concat(availRecentCache);
+      const seen = new Set();
+      const out = [];
+      for (const it of merged){
+        const key =
+          String(it && it.reqId ? it.reqId : '') + ':' +
+          String(it && it.ts ? it.ts : '') + ':' +
+          String(it && it.providerId ? it.providerId : '') + ':' +
+          String(it && it.upstreamId ? it.upstreamId : '') + ':' +
+          String(it && it.model ? it.model : '') + ':' +
+          String(it && it.path ? it.path : '');
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(it);
+        if (out.length >= 240) break;
+      }
+      availRecentCache = out;
+      setAvailRecentStatus('最近记录：' + availRecentCache.length + ' 条' + (availSince ? (' · since=' + availSince) : ''));
+      renderAvailRecent(availRecentCache);
+    }
+
+    function startAvailPolling(){
+      if (availPollTimer) return;
+      availPollTimer = setInterval(() => { pollAvailRecentOnce(); }, 2000);
+    }
+    function stopAvailPolling(){
+      if (!availPollTimer) return;
+      try { clearInterval(availPollTimer); } catch {}
+      availPollTimer = null;
+    }
+    async function ensureAvailabilityTab(){
+      if (!isAvailabilityTabActive()) return;
+      await loadAvailOverview();
+      await pollAvailRecentOnce();
+      startAvailPolling();
+    }
+
+    availRefreshEl?.addEventListener('click', () => { ensureAvailabilityTab(); });
+    availDaysEl?.addEventListener('change', () => { ensureAvailabilityTab(); });
+    availGroupByEl?.addEventListener('change', () => { ensureAvailabilityTab(); });
+    availAutoEl?.addEventListener('change', () => { if (availAutoEl.checked) pollAvailRecentOnce(); });
+    availSearchEl?.addEventListener('input', () => { renderAvailRecent(availRecentCache); });
+    availOnlyErrEl?.addEventListener('change', () => { renderAvailRecent(availRecentCache); });
+    availClearEl?.addEventListener('click', () => { availSince = 0; availRecentCache = []; renderAvailRecent([]); setAvailRecentStatus('已清空显示'); });
+    window.addEventListener('resize', () => {
+      try{
+        if (!isAvailabilityTabActive() || !availOverviewCache) return;
+        const daysList = Array.isArray(availOverviewCache.days) ? availOverviewCache.days : [];
+        const labels = daysList.map(d => String(d && d.date ? d.date : ''));
+        const values = daysList.map(d => {
+          const rr = Number(d && d.okRate);
+          return Math.max(0, Math.min(100, Math.round((Number.isFinite(rr) ? rr : 0) * 10000) / 100));
+        });
+        drawLineChart(availDailyChartEl, labels, values);
       } catch {}
     });
 
@@ -3865,6 +4231,43 @@ export default {
         return withCors(jsonResponse(404, jsonError("Not found", "not_found")), corsHeaders);
       }
 
+      // Availability metrics (in-memory; opt-in via WEB_UI_ENABLED or RSP4COPILOT_TOKEN_STATS_ENABLED)
+      if (request.method === "GET" && path.startsWith("/v1/metrics/availability")) {
+        if (!metricsEnabled) {
+          return withCors(
+            jsonResponse(
+              404,
+              availabilityMetricsErrorResponse("可用率统计未启用（设置 WEB_UI_ENABLED=true 或 RSP4COPILOT_TOKEN_STATS_ENABLED=true）", "not_found"),
+            ),
+            corsHeaders,
+          );
+        }
+
+        if (path === "/v1/metrics/availability/recent") {
+          const limit = Number(url.searchParams.get("limit") || 200);
+          const sinceTs = Number(url.searchParams.get("since") || 0);
+          const providerId = url.searchParams.get("provider") || "";
+          const upstreamId = url.searchParams.get("upstream") || "";
+          const model = url.searchParams.get("model") || "";
+          const statusRaw = (url.searchParams.get("status") || "").trim().toLowerCase();
+          const status = statusRaw === "error" ? "error" : statusRaw === "ok" ? "ok" : undefined;
+          const records = availabilityMetrics.getRecent({ limit, sinceTs, providerId, upstreamId, model, status });
+          const nextSince = records.reduce((m, r) => (r.ts > m ? r.ts : m), sinceTs || 0);
+          return withCors(jsonResponse(200, { ok: true, now: Date.now(), nextSince, records }), corsHeaders);
+        }
+
+        if (path === "/v1/metrics/availability/overview") {
+          const days = Number(url.searchParams.get("days") || 30);
+          const groupByRaw = (url.searchParams.get("groupBy") || "").trim().toLowerCase();
+          const groupBy =
+            groupByRaw === "provider" || groupByRaw === "model" || groupByRaw === "upstream_model" ? (groupByRaw as any) : "upstream";
+          const overview = availabilityMetrics.getOverview({ days, groupBy });
+          return withCors(jsonResponse(200, { ok: true, now: Date.now(), ...overview }), corsHeaders);
+        }
+
+        return withCors(jsonResponse(404, jsonError("Not found", "not_found")), corsHeaders);
+      }
+
       // Models list
       if (
         request.method === "GET" &&
@@ -4027,6 +4430,7 @@ export default {
             ...(reasoningEffort ? { RESP_REASONING_EFFORT: reasoningEffort } : null),
           };
 
+          const attemptStartedAt = Date.now();
           const resp = await handleOpenAIRequest({
             request,
             env: env2,
@@ -4041,6 +4445,21 @@ export default {
             isTextCompletions: true,
             extraSystemText,
           });
+          if (metricsEnabled) {
+            try {
+              availabilityMetrics.record({
+                ts: attemptStartedAt,
+                reqId,
+                path,
+                stream,
+                providerId: resolved.provider.id,
+                upstreamId: upstream.id || resolved.provider.id,
+                model: resolved.model.name || resolved.model.upstreamModel,
+                status: resp.ok ? "ok" : "error",
+                latencyMs: Math.max(0, Date.now() - attemptStartedAt),
+              });
+            } catch {}
+          }
 
           const shouldStop = resp.ok || !shouldTryNextUpstreamCandidateStatus(resp.status) || i === upstreamCandidates.length - 1;
           const outResp =
@@ -4124,6 +4543,7 @@ export default {
               ...(reasoningEffort ? { RESP_REASONING_EFFORT: reasoningEffort } : null),
             };
 
+            const attemptStartedAt = Date.now();
             const upstreamResp = await handleOpenAIResponsesUpstream({
               request,
               env: env2,
@@ -4137,6 +4557,21 @@ export default {
               path,
               startedAt,
             });
+            if (metricsEnabled) {
+              try {
+                availabilityMetrics.record({
+                  ts: attemptStartedAt,
+                  reqId,
+                  path,
+                  stream,
+                  providerId: resolved.provider.id,
+                  upstreamId: upstream.id || resolved.provider.id,
+                  model: resolved.model.name || resolved.model.upstreamModel,
+                  status: upstreamResp.ok ? "ok" : "error",
+                  latencyMs: Math.max(0, Date.now() - attemptStartedAt),
+                });
+              } catch {}
+            }
 
             const shouldStop =
               upstreamResp.ok || !shouldTryNextUpstreamCandidateStatus(upstreamResp.status) || i === upstreamCandidates.length - 1;
@@ -4294,7 +4729,23 @@ export default {
             ...(messagesPath ? { CLAUDE_MESSAGES_PATH: messagesPath } : null),
           };
 
+          const attemptStartedAt = Date.now();
           const resp = await handleClaudeCountTokens({ request, env: env2, reqJson, debug, reqId });
+          if (metricsEnabled) {
+            try {
+              availabilityMetrics.record({
+                ts: attemptStartedAt,
+                reqId,
+                path,
+                stream: false,
+                providerId: resolved.provider.id,
+                upstreamId: upstream.id || resolved.provider.id,
+                model: resolved.model.name || resolved.model.upstreamModel,
+                status: resp.ok ? "ok" : "error",
+                latencyMs: Math.max(0, Date.now() - attemptStartedAt),
+              });
+            } catch {}
+          }
           lastResp = resp;
           if (resp.ok) return withCors(resp, corsHeaders);
           if (!shouldTryNextUpstreamCandidateStatus(resp.status) || i === upstreamCandidates.length - 1) return withCors(resp, corsHeaders);
@@ -4348,6 +4799,7 @@ export default {
               GEMINI_API_KEY: upstream.apiKey,
               ...(upstreamHeadersEnv ? { RSP4COPILOT_UPSTREAM_HEADERS: upstreamHeadersEnv } : null),
             };
+            const attemptStartedAt = Date.now();
             const upstreamResp = await handleGeminiGenerateContentUpstream({
               request,
               env: env2,
@@ -4357,6 +4809,21 @@ export default {
               debug,
               reqId,
             });
+            if (metricsEnabled) {
+              try {
+                availabilityMetrics.record({
+                  ts: attemptStartedAt,
+                  reqId,
+                  path,
+                  stream,
+                  providerId: resolved.provider.id,
+                  upstreamId: upstream.id || resolved.provider.id,
+                  model: resolved.model.name || resolved.model.upstreamModel,
+                  status: upstreamResp.ok ? "ok" : "error",
+                  latencyMs: Math.max(0, Date.now() - attemptStartedAt),
+                });
+              } catch {}
+            }
 
             const shouldStop =
               upstreamResp.ok || !shouldTryNextUpstreamCandidateStatus(upstreamResp.status) || i === upstreamCandidates.length - 1;

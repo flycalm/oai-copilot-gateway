@@ -6,6 +6,7 @@ import { handleGeminiChatCompletions } from "./providers/gemini";
 import { handleOpenAIChatCompletionsUpstream, handleOpenAIRequest } from "./providers/openai";
 import { listUpstreamCandidates, shouldTryNextUpstreamCandidateStatus } from "./upstreams";
 import { instrumentResponseAndRecordTokens, tokenEstimates } from "./metrics";
+import { availabilityMetrics } from "./availability";
 
 function envWithOverrides(env: Env, overrides: Record<string, string> | null): Env {
   const base = env && typeof env === "object" ? env : {};
@@ -63,6 +64,23 @@ export async function dispatchOpenAIChatToProvider({
     }
   })();
 
+  const recordAvailabilityAttempt = (attemptStartedAt: number, upstreamId: string, resp0: Response) => {
+    if (!metricsEnabled) return;
+    try {
+      availabilityMetrics.record({
+        ts: attemptStartedAt,
+        reqId,
+        path: typeof path === "string" ? path : "",
+        stream,
+        providerId: provider.id,
+        upstreamId: upstreamId || provider.id,
+        model: model.name || model.upstreamModel,
+        status: resp0 && resp0.ok ? "ok" : "error",
+        latencyMs: Math.max(0, Date.now() - attemptStartedAt),
+      });
+    } catch {}
+  };
+
   const upstreamCandidates = listUpstreamCandidates({ env, provider, request, reqId });
   if (!upstreamCandidates.length) {
     return jsonResponse(500, jsonError(`Server misconfigured: missing upstream API key for provider ${provider.id}`, "server_error"));
@@ -106,6 +124,7 @@ export async function dispatchOpenAIChatToProvider({
         ...(maxInstructionsChars != null ? { RESP_MAX_INSTRUCTIONS_CHARS: String(maxInstructionsChars) } : null),
       });
 
+      const attemptStartedAt = Date.now();
       const resp0 = await handleOpenAIRequest({
         request,
         env: env2,
@@ -120,6 +139,7 @@ export async function dispatchOpenAIChatToProvider({
         isTextCompletions: false,
         extraSystemText,
       });
+      recordAvailabilityAttempt(attemptStartedAt, upstream.id || provider.id, resp0);
 
       const shouldStop = resp0.ok || !shouldTryNextUpstreamCandidateStatus(resp0.status) || i === upstreamCandidates.length - 1;
       const resp = metricsEnabled && shouldStop
@@ -162,6 +182,7 @@ export async function dispatchOpenAIChatToProvider({
         ...(maxInstructionsChars != null ? { RESP_MAX_INSTRUCTIONS_CHARS: String(maxInstructionsChars) } : null),
       });
 
+      const attemptStartedAt = Date.now();
       const resp0 = await handleOpenAIChatCompletionsUpstream({
         request,
         env: env2,
@@ -175,6 +196,7 @@ export async function dispatchOpenAIChatToProvider({
         startedAt: typeof startedAt === "number" && Number.isFinite(startedAt) ? startedAt : Date.now(),
         extraSystemText,
       });
+      recordAvailabilityAttempt(attemptStartedAt, upstream.id || provider.id, resp0);
 
       const shouldStop = resp0.ok || !shouldTryNextUpstreamCandidateStatus(resp0.status) || i === upstreamCandidates.length - 1;
       const resp = metricsEnabled && shouldStop
@@ -215,6 +237,7 @@ export async function dispatchOpenAIChatToProvider({
         ...(claudeMaxTokens != null ? { CLAUDE_MAX_TOKENS: String(claudeMaxTokens) } : null),
       });
 
+      const attemptStartedAt = Date.now();
       const resp0 = await handleClaudeChatCompletions({
         request,
         env: env2,
@@ -225,6 +248,7 @@ export async function dispatchOpenAIChatToProvider({
         reqId,
         extraSystemText,
       });
+      recordAvailabilityAttempt(attemptStartedAt, upstream.id || provider.id, resp0);
 
       const shouldStop = resp0.ok || !shouldTryNextUpstreamCandidateStatus(resp0.status) || i === upstreamCandidates.length - 1;
       const resp = metricsEnabled && shouldStop
@@ -253,6 +277,7 @@ export async function dispatchOpenAIChatToProvider({
         ...(upstreamHeadersEnv ? { RSP4COPILOT_UPSTREAM_HEADERS: upstreamHeadersEnv } : null),
       });
 
+      const attemptStartedAt = Date.now();
       const resp0 = await handleGeminiChatCompletions({
         request,
         env: env2,
@@ -264,6 +289,7 @@ export async function dispatchOpenAIChatToProvider({
         reqId,
         extraSystemText,
       });
+      recordAvailabilityAttempt(attemptStartedAt, upstream.id || provider.id, resp0);
 
       const shouldStop = resp0.ok || !shouldTryNextUpstreamCandidateStatus(resp0.status) || i === upstreamCandidates.length - 1;
       const resp = metricsEnabled && shouldStop
