@@ -3535,6 +3535,16 @@ export default {
         if (typeof model !== "string" || !model.trim()) return withCors(jsonResponse(400, jsonError("Missing required field: model")), corsHeaders);
 
         const stream = Boolean(reqJson.stream);
+        // Try to get usage for streaming Chat Completions:
+        // OpenAI-compatible endpoints support `stream_options: { include_usage: true }` to emit a final chunk with usage.
+        if (stream) {
+          const so = reqJson.stream_options;
+          if (!so || typeof so !== "object" || Array.isArray(so)) {
+            reqJson.stream_options = { include_usage: true };
+          } else if (!("include_usage" in so)) {
+            (so as any).include_usage = true;
+          }
+        }
         const extraSystemText = shouldInjectCopilotToolUseInstructions(request, reqJson) ? copilotToolUseInstructionsText() : "";
 
         if (gatewayCfg.ok && gatewayCfg.config) {
