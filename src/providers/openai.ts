@@ -1585,6 +1585,7 @@ function buildChatCompletionsSseFromNonStreamJson(parsed: any, fallbackModel: st
     created,
     model: outModel,
     choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+    ...(parsed?.usage && typeof parsed.usage === "object" ? { usage: parsed.usage } : {}),
   };
 
   return new ReadableStream<Uint8Array>({
