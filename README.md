@@ -150,16 +150,90 @@ npx wrangler dev --local --port 8788
 
 本仓库默认是 Cloudflare Worker，但也提供了一个 Node.js runtime 适配层，便于用 Docker 在公网服务器上部署（同一套路由/协议转换逻辑）。
 
+### 0) 前置条件
+
+- 已安装 `docker` 与 `docker compose`
+- 建议配反代（Nginx/Caddy）+ HTTPS，只对公网开放 80/443（不要直接暴露 8788）
+
+更完整的公网部署指南见：`docs/DEPLOYMENT_GUIDE.md`。
+
+---
+
+### 1) 准备配置文件（会挂载到容器 /config）
+
+1) 复制 `.env`：
+
 ```bash
 cp .env.example .env
-# 1) 修改 `.env`（至少填 WORKER_AUTH_KEY 与各 upstream key）
-# 2) 复制并修改配置文件（baseURL / model / upstreams）
-cp configs/rsp4copilot.config.example.jsonc configs/rsp4copilot.config.jsonc
-${EDITOR:-vi} configs/rsp4copilot.config.jsonc
-docker compose up -d --build
 ```
 
-默认容器监听：`0.0.0.0:8788`；宿主机对外端口可用 `PUBLIC_PORT` 覆盖（见 `.env.example`）。健康检查：`GET /v1/health`。
+至少要填：
+- `WORKER_AUTH_KEY`：下游入口 Key（客户端调用你网关时用的 key，不是上游 key）
+- 你配置里引用到的上游 key（例如 `.env.example` 里的 `OPENAI_API_KEY_RELAY_A` 等）
+
+2) 复制并修改网关配置（JSONC）：
+
+```bash
+cp configs/rsp4copilot.config.example.jsonc configs/rsp4copilot.config.jsonc
+${EDITOR:-vi} configs/rsp4copilot.config.jsonc
+```
+
+> 注意：`baseURL` 填上游/中转站地址，不要填你自己的网关地址，否则会自我转发形成循环。
+
+---
+
+### 2) 启动（Docker Compose）
+
+```bash
+docker compose up -d --build
+docker compose ps
+```
+
+默认容器监听 `0.0.0.0:8788`；宿主机对外端口可用 `PUBLIC_PORT` 覆盖（见 `.env.example`）。
+
+健康检查：
+
+```bash
+curl -sS http://127.0.0.1:8788/v1/health \
+  -H "Authorization: Bearer $WORKER_AUTH_KEY"
+```
+
+看日志：
+
+```bash
+docker compose logs -f --tail=200
+```
+
+---
+
+### 3) Web UI（推荐只在内网/反代鉴权后启用）
+
+在 `.env` 里开启：
+- `WEB_UI_ENABLED=true`
+- `WEB_UI_BASIC_USER=admin`
+- `WEB_UI_BASIC_PASS=一个足够长的随机密码`
+
+然后访问：
+- `GET /` 或 `GET /ui`
+
+配置管理页支持：
+- 在线编辑 `providers` / `models` / `routes`
+- Provider 重命名（会自动迁移 v2 routes 的引用；如果你的客户端使用了完整模型 ID `providerId.modelName`，需要同步改客户端配置）
+
+---
+
+### 4) Docker 模式下的“落盘文件”说明
+
+`docker-compose.yml` 默认把仓库的 `./configs` 挂载到容器 `/config`，因此以下文件都会出现在宿主机 `./configs/` 目录：
+
+- `configs/rsp4copilot.config.jsonc`：网关主配置（对应容器内 `/config/rsp4copilot.config.jsonc`）
+- `configs/rsp4copilot.env`：Web UI 写入的上游 key 覆盖文件（对应容器内 `/config/rsp4copilot.env`，会覆盖 `.env` 同名变量）
+- `configs/rsp4copilot.stats.json`：统计数据持久化文件（Token 统计 / 可用率；对应容器内 `/config/rsp4copilot.stats.json`）
+
+你也可以用环境变量覆盖路径：
+- `RSP4COPILOT_ENV_FILE`（默认 `/config/rsp4copilot.env`）
+- `RSP4COPILOT_STATS_FILE`（默认 `/config/rsp4copilot.stats.json`）
+- `RSP4COPILOT_STATS_PERSIST=false` 可关闭统计落盘
 
 ## 快速 curl
 
