@@ -5,7 +5,7 @@ import { handleClaudeChatCompletions } from "./providers/claude";
 import { handleGeminiChatCompletions } from "./providers/gemini";
 import { handleOpenAIChatCompletionsUpstream, handleOpenAIRequest } from "./providers/openai";
 import { listUpstreamCandidates, shouldTryNextUpstreamCandidateStatus } from "./upstreams";
-import { instrumentResponseAndRecordTokens } from "./metrics";
+import { instrumentResponseAndRecordTokens, tokenEstimates } from "./metrics";
 
 function envWithOverrides(env: Env, overrides: Record<string, string> | null): Env {
   const base = env && typeof env === "object" ? env : {};
@@ -55,6 +55,13 @@ export async function dispatchOpenAIChatToProvider({
   extraSystemText: string;
 }): Promise<Response> {
   const metricsEnabled = parseBoolEnv((env as any)?.RSP4COPILOT_TOKEN_STATS_ENABLED) || parseBoolEnv((env as any)?.WEB_UI_ENABLED);
+  const estimatedPromptTokens = (() => {
+    try {
+      return tokenEstimates.estimatePromptTokensFromOpenAIChatReq(reqJson || {});
+    } catch {
+      return 0;
+    }
+  })();
 
   const upstreamCandidates = listUpstreamCandidates({ env, provider, request, reqId });
   if (!upstreamCandidates.length) {
@@ -124,6 +131,7 @@ export async function dispatchOpenAIChatToProvider({
             providerId: provider.id,
             upstreamId: upstream.id || provider.id,
             model: model.name || model.upstreamModel,
+            estimatedPromptTokens,
           })
         : resp0;
 
@@ -178,6 +186,7 @@ export async function dispatchOpenAIChatToProvider({
             providerId: provider.id,
             upstreamId: upstream.id || provider.id,
             model: model.name || model.upstreamModel,
+            estimatedPromptTokens,
           })
         : resp0;
 
@@ -227,6 +236,7 @@ export async function dispatchOpenAIChatToProvider({
             providerId: provider.id,
             upstreamId: upstream.id || provider.id,
             model: model.name || model.upstreamModel,
+            estimatedPromptTokens,
           })
         : resp0;
 
@@ -265,6 +275,7 @@ export async function dispatchOpenAIChatToProvider({
             providerId: provider.id,
             upstreamId: upstream.id || provider.id,
             model: model.name || model.upstreamModel,
+            estimatedPromptTokens,
           })
         : resp0;
 

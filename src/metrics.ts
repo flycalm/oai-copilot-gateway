@@ -20,6 +20,7 @@ export type TokenMetricRecord = {
   status: TokenMetricStatus;
   latencyMs?: number;
   usage?: UsageTokens;
+  usageSource?: "upstream" | "estimate";
 };
 
 export type TokenMetricAgg = {
@@ -65,6 +66,97 @@ function normalizeUsageTokens(raw: unknown): UsageTokens | null {
   const out: UsageTokens = { prompt_tokens: prompt, completion_tokens: completion, total_tokens: total };
   if (cached) out.cached_tokens = cached;
   return out;
+}
+
+function countTextChars(text: string): { cjk: number; other: number } {
+  const s = String(text || "");
+  let cjk = 0;
+  let other = 0;
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    // Rough CJK ranges: Chinese/Japanese/Korean blocks.
+    const isCjk =
+      (code >= 0x4e00 && code <= 0x9fff) || // CJK Unified Ideographs
+      (code >= 0x3400 && code <= 0x4dbf) || // CJK Unified Ideographs Extension A
+      (code >= 0x3040 && code <= 0x30ff) || // Hiragana + Katakana
+      (code >= 0xac00 && code <= 0xd7af); // Hangul Syllables
+    if (isCjk) cjk++;
+    else other++;
+  }
+  return { cjk, other };
+}
+
+function estimateTokensFromText(text: string): number {
+  const { cjk, other } = countTextChars(text);
+  // Heuristic:
+  // - CJK: ~1 char ~= 1 token
+  // - non-CJK: ~4 chars ~= 1 token
+  return Math.max(0, cjk + Math.ceil(other / 4));
+}
+
+function collectTextFromUnknownContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (content == null) return "";
+  if (Array.isArray(content)) {
+    return content.map((p) => collectTextFromUnknownContent(p)).filter(Boolean).join("\n");
+  }
+  if (typeof content === "object") {
+    const obj: any = content;
+    // Common shapes:
+    // - OpenAI: {type:"text", text:"..."} / {type:"input_text", text:"..."}
+    // - Gemini parts: {text:"..."}
+    if (typeof obj.text === "string") return obj.text;
+    if (typeof obj.content === "string") return obj.content;
+    if (Array.isArray(obj.content)) return collectTextFromUnknownContent(obj.content);
+    if (typeof obj.input_text === "string") return obj.input_text;
+  }
+  return "";
+}
+
+function estimatePromptTokensFromOpenAIChatReq(reqJson: Record<string, unknown>): number {
+  const messages = Array.isArray((reqJson as any).messages) ? ((reqJson as any).messages as any[]) : [];
+  let text = "";
+  for (const m of messages) {
+    if (!m || typeof m !== "object") continue;
+    const content = (m as any).content;
+    const t = collectTextFromUnknownContent(content);
+    if (t) text += (text ? "\n" : "") + t;
+    const toolCalls = Array.isArray((m as any).tool_calls) ? (m as any).tool_calls : [];
+    for (const tc of toolCalls) {
+      const fn = tc && typeof tc === "object" ? (tc as any).function : null;
+      const args = fn && typeof fn.arguments === "string" ? fn.arguments : "";
+      if (args) text += "\n" + args;
+    }
+  }
+  const base = estimateTokensFromText(text);
+  // Add a small per-message overhead for roles/formatting
+  return Math.max(0, base + messages.length * 6);
+}
+
+function estimatePromptTokensFromOpenAIResponsesReq(reqJson: Record<string, unknown>): number {
+  const input = Array.isArray((reqJson as any).input) ? ((reqJson as any).input as any[]) : [];
+  const instructions = typeof (reqJson as any).instructions === "string" ? String((reqJson as any).instructions) : "";
+  let text = instructions ? instructions + "\n" : "";
+  for (const it of input) {
+    if (!it || typeof it !== "object") continue;
+    const content = (it as any).content;
+    const t = collectTextFromUnknownContent(content);
+    if (t) text += t + "\n";
+  }
+  return Math.max(0, estimateTokensFromText(text) + input.length * 6);
+}
+
+function estimatePromptTokensFromGeminiReq(reqJson: Record<string, unknown>): number {
+  const contents = Array.isArray((reqJson as any).contents) ? ((reqJson as any).contents as any[]) : [];
+  let text = "";
+  for (const c of contents) {
+    const parts = Array.isArray(c?.parts) ? c.parts : [];
+    for (const p of parts) {
+      const t = collectTextFromUnknownContent(p);
+      if (t) text += (text ? "\n" : "") + t;
+    }
+  }
+  return Math.max(0, estimateTokensFromText(text) + contents.length * 4);
 }
 
 function normalizeGeminiUsageMetadataToUsageTokens(raw: unknown): UsageTokens | null {
@@ -126,6 +218,48 @@ function parseSseMessages(text: string): Array<{ data: string }> {
   return out;
 }
 
+function extractDeltaTextFromSseJson(obj: unknown): string {
+  const root = obj && typeof obj === "object" ? (obj as any) : null;
+  if (!root) return "";
+  // OpenAI Chat Completions chunk
+  const choices = Array.isArray(root.choices) ? root.choices : [];
+  const c0 = choices.length ? choices[0] : null;
+  const delta = c0 && typeof c0.delta === "object" ? c0.delta : null;
+  if (delta && typeof delta.content === "string") return delta.content;
+
+  // OpenAI Responses SSE translated events: response.output_text.delta
+  const type = typeof root.type === "string" ? root.type : "";
+  if (type === "response.output_text.delta" && typeof root.delta === "string") return root.delta;
+
+  return "";
+}
+
+function extractOutputTextFromJson(obj: unknown): string {
+  const root = obj && typeof obj === "object" ? (obj as any) : null;
+  if (!root) return "";
+
+  // OpenAI Chat Completions JSON: choices[0].message.content
+  const choices = Array.isArray(root.choices) ? root.choices : [];
+  const c0 = choices.length ? choices[0] : null;
+  const msg = c0 && typeof c0.message === "object" ? c0.message : null;
+  const content = msg ? msg.content : null;
+  const chatText = collectTextFromUnknownContent(content);
+  if (chatText) return chatText;
+
+  // OpenAI Responses JSON: output_text (best effort)
+  if (typeof root.output_text === "string" && root.output_text) return root.output_text;
+  if (typeof root.outputText === "string" && root.outputText) return root.outputText;
+
+  // Gemini JSON: candidates[0].content.parts[].text
+  const candidates = Array.isArray(root.candidates) ? root.candidates : [];
+  const cand = candidates.length ? candidates[0] : null;
+  const parts = Array.isArray(cand?.content?.parts) ? cand.content.parts : [];
+  const gemText = parts.map((p: any) => (typeof p?.text === "string" ? p.text : "")).filter(Boolean).join("");
+  if (gemText) return gemText;
+
+  return "";
+}
+
 export class TokenMetricsStore {
   private recent: TokenMetricRecord[] = [];
   private dailyByUpstream = new Map<string, Map<string, TokenMetricAgg>>();
@@ -149,6 +283,7 @@ export class TokenMetricsStore {
       status: rec.status === "error" ? "error" : "ok",
       ...(Number.isFinite(Number(rec.latencyMs)) ? { latencyMs: Math.max(0, Math.floor(Number(rec.latencyMs))) } : {}),
       ...(rec.usage ? { usage: rec.usage } : {}),
+      ...(rec.usageSource ? { usageSource: rec.usageSource } : {}),
     };
 
     this.recent.unshift(r);
@@ -299,7 +434,7 @@ export function tokenMetricsErrorResponse(message: string, code = "not_found"): 
 
 export async function instrumentResponseAndRecordTokens(
   resp: Response,
-  ctx: Omit<TokenMetricRecord, "status"> & { status?: TokenMetricStatus },
+  ctx: Omit<TokenMetricRecord, "status" | "usage" | "usageSource"> & { status?: TokenMetricStatus; estimatedPromptTokens?: number },
 ): Promise<Response> {
   const base: Omit<TokenMetricRecord, "status"> = {
     ts: ctx.ts,
@@ -310,19 +445,32 @@ export async function instrumentResponseAndRecordTokens(
     upstreamId: ctx.upstreamId,
     model: ctx.model,
     ...(typeof ctx.latencyMs === "number" ? { latencyMs: ctx.latencyMs } : {}),
-    ...(ctx.usage ? { usage: ctx.usage } : {}),
   };
 
   const status: TokenMetricStatus = ctx.status === "error" ? "error" : resp && !resp.ok ? "error" : "ok";
   const startedAt = Number.isFinite(Number(ctx.ts)) ? Number(ctx.ts) : Date.now();
+  const estimatedPromptTokens = Number.isFinite(Number(ctx.estimatedPromptTokens)) ? Math.max(0, Math.floor(Number(ctx.estimatedPromptTokens))) : 0;
 
   const contentType = (resp.headers.get("content-type") || "").toLowerCase();
   if (contentType.includes("application/json")) {
     let usage: UsageTokens | null = null;
+    let usageSource: "upstream" | "estimate" | undefined = undefined;
     try {
       const cloned = resp.clone();
       const obj = await cloned.json().catch(() => null);
       usage = extractUsageTokensFromJsonLike(obj);
+      if (usage) {
+        usageSource = "upstream";
+      } else if (estimatedPromptTokens > 0) {
+        const outputText = extractOutputTextFromJson(obj);
+        const estimatedCompletion = outputText ? estimateTokensFromText(outputText) : 0;
+        usage = {
+          prompt_tokens: estimatedPromptTokens,
+          completion_tokens: estimatedCompletion,
+          total_tokens: estimatedPromptTokens + estimatedCompletion,
+        };
+        usageSource = "estimate";
+      }
     } catch {
       usage = null;
     }
@@ -331,6 +479,7 @@ export async function instrumentResponseAndRecordTokens(
       status,
       latencyMs: Math.max(0, Date.now() - startedAt),
       ...(usage ? { usage } : {}),
+      ...(usageSource ? { usageSource } : {}),
     });
     return resp;
   }
@@ -341,6 +490,8 @@ export async function instrumentResponseAndRecordTokens(
     const encoder = new TextEncoder();
     let buffer = "";
     let lastUsage: UsageTokens | null = null;
+    let outCjk = 0;
+    let outOther = 0;
 
     const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
     const writer = writable.getWriter();
@@ -369,6 +520,13 @@ export async function instrumentResponseAndRecordTokens(
               }
               const u = extractUsageTokensFromJsonLike(obj);
               if (u) lastUsage = u;
+
+              const deltaText = extractDeltaTextFromSseJson(obj);
+              if (deltaText) {
+                const counted = countTextChars(deltaText);
+                outCjk += counted.cjk;
+                outOther += counted.other;
+              }
             }
           }
         }
@@ -381,11 +539,23 @@ export async function instrumentResponseAndRecordTokens(
         try {
           reader.releaseLock();
         } catch {}
+        let usage: UsageTokens | null = lastUsage;
+        let usageSource: "upstream" | "estimate" | undefined = usage ? "upstream" : undefined;
+        if (!usage && estimatedPromptTokens > 0) {
+          const estimatedCompletion = Math.max(0, outCjk + Math.ceil(outOther / 4));
+          usage = {
+            prompt_tokens: estimatedPromptTokens,
+            completion_tokens: estimatedCompletion,
+            total_tokens: estimatedPromptTokens + estimatedCompletion,
+          };
+          usageSource = "estimate";
+        }
         tokenMetrics.record({
           ...base,
           status,
           latencyMs: Math.max(0, Date.now() - startedAt),
-          ...(lastUsage ? { usage: lastUsage } : {}),
+          ...(usage ? { usage } : {}),
+          ...(usageSource ? { usageSource } : {}),
         });
       }
     })();
@@ -394,10 +564,26 @@ export async function instrumentResponseAndRecordTokens(
     return new Response(readable, { status: resp.status, headers });
   }
 
+  const usage =
+    estimatedPromptTokens > 0
+      ? ({
+          prompt_tokens: estimatedPromptTokens,
+          completion_tokens: 0,
+          total_tokens: estimatedPromptTokens,
+        } satisfies UsageTokens)
+      : null;
   tokenMetrics.record({
     ...base,
     status,
     latencyMs: Math.max(0, Date.now() - startedAt),
+    ...(usage ? { usage, usageSource: "estimate" } : {}),
   });
   return resp;
 }
+
+export const tokenEstimates = {
+  estimatePromptTokensFromOpenAIChatReq,
+  estimatePromptTokensFromOpenAIResponsesReq,
+  estimatePromptTokensFromGeminiReq,
+  estimateTokensFromText,
+};

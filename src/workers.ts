@@ -34,7 +34,7 @@ import { claudeMessagesRequestToOpenaiChat, handleClaudeCountTokens, openaiChatR
 import { parseGatewayConfig } from "./config";
 import { dispatchOpenAIChatToProvider } from "./dispatch";
 import { resolveModel } from "./model_resolver";
-import { geminiModelsList, ollamaModelsList, openaiModelsListFromEntries, type ModelListEntry } from "./models_list";
+import { geminiModelsList, ollamaModelsList, openaiModelsList } from "./models_list";
 import { fetchUpstreamModelsForProvider } from "./models_discovery";
 import { handleGeminiGenerateContentUpstream } from "./providers/gemini";
 import { handleOpenAIRequest, handleOpenAIResponsesUpstream } from "./providers/openai";
@@ -42,7 +42,7 @@ import { geminiRequestToOpenAIChat, openAIChatResponseToGemini } from "./protoco
 import { openAIChatResponseToResponses, responsesRequestToOpenAIChat } from "./protocols/responses";
 import { openAIChatSseToGeminiSse, openAIChatSseToResponsesSse } from "./protocols/stream";
 import { listUpstreamCandidates, shouldTryNextUpstreamCandidateStatus } from "./upstreams";
-import { instrumentResponseAndRecordTokens, tokenMetrics, tokenMetricsErrorResponse } from "./metrics";
+import { instrumentResponseAndRecordTokens, tokenEstimates, tokenMetrics, tokenMetricsErrorResponse } from "./metrics";
 
 function getCorsHeaders(request: Request): Record<string, string> {
   const origin = request.headers.get("origin") || "";
@@ -1300,16 +1300,18 @@ function webUiHtml(): string {
       for (const r of filtered){
         const tr = document.createElement('tr');
         const usage = r && r.usage ? r.usage : null;
+        const usageSource = r && r.usageSource ? String(r.usageSource) : '';
         const ts = fmtInt(r && r.ts);
         const timeStr = ts ? new Date(ts).toLocaleString('zh-CN', { hour12: false }) : '-';
         const providerId = String(r && r.providerId ? r.providerId : '');
         const upstreamId = String(r && r.upstreamId ? r.upstreamId : '');
         const upstreamLabel = upstreamId && upstreamId !== providerId ? (providerId + '/' + upstreamId) : (providerId || upstreamId || '-');
         const model = String(r && r.model ? r.model : '');
-        const prompt = usage ? fmtTokens(usage.prompt_tokens) : '-';
-        const completion = usage ? fmtTokens(usage.completion_tokens) : '-';
-        const total = usage ? fmtTokens(usage.total_tokens) : '-';
-        const cached = usage && usage.cached_tokens ? fmtTokens(usage.cached_tokens) : '-';
+        const prefix = usage && usageSource === 'estimate' ? '~' : '';
+        const prompt = usage ? (prefix + fmtTokens(usage.prompt_tokens)) : '-';
+        const completion = usage ? (prefix + fmtTokens(usage.completion_tokens)) : '-';
+        const total = usage ? (prefix + fmtTokens(usage.total_tokens)) : '-';
+        const cached = usage && usage.cached_tokens ? (prefix + fmtTokens(usage.cached_tokens)) : '-';
         const latency = r && r.latencyMs != null ? fmtMs(r.latencyMs) : '-';
         const stream = r && r.stream ? '是' : '否';
         const statusOk = (r && r.status) ? String(r.status) === 'ok' : true;
@@ -1623,6 +1625,10 @@ function webUiHtml(): string {
 		      if (!cfgObj || typeof cfgObj !== 'object') cfgObj = { version: 1, providers: {} };
 		      if (!cfgObj.providers || typeof cfgObj.providers !== 'object') cfgObj.providers = {};
 		      if (!cfgObj.version) cfgObj.version = 1;
+		      if (Number(cfgObj.version) === 2) {
+		        if (!cfgObj.models || typeof cfgObj.models !== 'object') cfgObj.models = {};
+		        if (!cfgObj.routes || typeof cfgObj.routes !== 'object') cfgObj.routes = {};
+		      }
 		      return cfgObj;
 		    }
 
@@ -2218,7 +2224,7 @@ function webUiHtml(): string {
 	    function cfgToWritableObject(){
 	      const root = ensureCfgObj();
 	      const out = JSON.parse(JSON.stringify(root || {}));
-	      if (!out || typeof out !== 'object') return { version: 1, providers: {} };
+	      if (!out || typeof out !== 'object') return { version: Number(root && root.version) === 2 ? 2 : 1, providers: {} };
 	      if (!out.providers || typeof out.providers !== 'object') out.providers = {};
 
 	      for (const pid of Object.keys(out.providers)) {
@@ -3469,19 +3475,7 @@ export default {
         if (!gatewayCfg.ok || !gatewayCfg.config) {
           return withCors(jsonResponse(500, jsonError(gatewayCfg.error || "Server misconfigured: missing RSP4COPILOT_CONFIG", "server_error")), corsHeaders);
         }
-        const entries: ModelListEntry[] = [];
-        const seen = new Set<string>();
-        for (const [providerId, provider] of Object.entries(gatewayCfg.config.providers || {})) {
-          const ownedBy = typeof provider?.ownedBy === "string" && provider.ownedBy.trim() ? provider.ownedBy.trim() : providerId;
-          for (const modelName of Object.keys(provider.models || {})) {
-            const key = `${providerId}::${modelName}`;
-            if (seen.has(key)) continue;
-            seen.add(key);
-            entries.push({ providerId, modelName, ownedBy });
-          }
-        }
-
-        return withCors(jsonResponse(200, openaiModelsListFromEntries(entries)), corsHeaders);
+        return withCors(jsonResponse(200, openaiModelsList(gatewayCfg.config)), corsHeaders);
       }
       if (request.method === "GET" && path === "/v1/upstream_models") {
         if (!gatewayCfg.ok || !gatewayCfg.config) {
@@ -3661,6 +3655,13 @@ export default {
                   providerId: resolved.provider.id,
                   upstreamId: upstream.id || resolved.provider.id,
                   model: resolved.model.name || resolved.model.upstreamModel,
+                  estimatedPromptTokens: (() => {
+                    try {
+                      return tokenEstimates.estimatePromptTokensFromOpenAIChatReq(reqJson || {});
+                    } catch {
+                      return 0;
+                    }
+                  })(),
                 })
               : resp;
 
@@ -3751,6 +3752,13 @@ export default {
                     providerId: resolved.provider.id,
                     upstreamId: upstream.id || resolved.provider.id,
                     model: resolved.model.name || resolved.model.upstreamModel,
+                    estimatedPromptTokens: (() => {
+                      try {
+                        return tokenEstimates.estimatePromptTokensFromOpenAIResponsesReq(respReq || {});
+                      } catch {
+                        return 0;
+                      }
+                    })(),
                   })
                 : upstreamResp;
 
@@ -3964,6 +3972,13 @@ export default {
                     providerId: resolved.provider.id,
                     upstreamId: upstream.id || resolved.provider.id,
                     model: resolved.model.name || resolved.model.upstreamModel,
+                    estimatedPromptTokens: (() => {
+                      try {
+                        return tokenEstimates.estimatePromptTokensFromGeminiReq((parsed.value as any) || {});
+                      } catch {
+                        return 0;
+                      }
+                    })(),
                   })
                 : upstreamResp;
 
