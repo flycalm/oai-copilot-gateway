@@ -1,5 +1,6 @@
 import {
   appendInstructions,
+  applyUpstreamCustomHeaders,
   applyTemperatureTopPFromRequest,
   encodeSseData,
   getSessionKey,
@@ -14,6 +15,7 @@ import {
   normalizeBaseUrl,
   normalizeMessageContent,
   normalizeToolCallsFromChatMessage,
+  parseBoolEnv,
   previewString,
   redactHeadersForLog,
   safeJsonStringifyForLog,
@@ -1288,6 +1290,11 @@ async function selectUpstreamResponse(upstreamUrl, headers, variants, debug = fa
   let exhaustedRetryable = false;
   let sawEmptyEventStream = false;
 
+  const isProbablyHtml = (resp) => {
+    const ct = String(resp?.headers?.get?.("content-type") || "").toLowerCase();
+    return ct.includes("text/html");
+  };
+
   const retryEmptySseAsNonStream = async (variantObj) => {
     if (!variantObj || typeof variantObj !== "object") return null;
 
@@ -1405,6 +1412,12 @@ async function selectUpstreamResponse(upstreamUrl, headers, variants, debug = fa
 
       resp = nonStream;
     }
+    if (resp.ok && isProbablyHtml(resp)) {
+      // Wrong path/base URL is commonly served by a UI router with a 200 HTML `index.html`.
+      // Treat as an upstream failure so we can try other candidate URLs (e.g. `/chat/completions` vs `/v1/chat/completions`).
+      const error = jsonError("Upstream returned HTML (likely wrong baseURL/path)", "bad_gateway");
+      return { ok: false, status: 502, error, upstreamUrl };
+    }
     if (resp.status >= 400) {
       lastStatus = resp.status;
       lastText = await resp.text().catch(() => "");
@@ -1449,6 +1462,139 @@ function shouldTryNextUpstreamUrl(status) {
   // Gateways often return 403/404/405 for wrong paths; 502 for network/DNS.
   // Some gateways also return 400/422 for unhandled routes.
   return status === 400 || status === 422 || status === 403 || status === 404 || status === 405 || status === 500 || status === 502 || status === 503;
+}
+
+function buildChatCompletionsSseFromNonStreamJson(parsed: any, fallbackModel: string): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder();
+  const created0 = Number(parsed?.created);
+  const created = Number.isFinite(created0) ? Math.floor(created0) : Math.floor(Date.now() / 1000);
+  const id = typeof parsed?.id === "string" ? String(parsed.id) : "";
+  const outModel = typeof parsed?.model === "string" ? String(parsed.model) : fallbackModel;
+
+  const choice0 = Array.isArray(parsed?.choices) ? parsed.choices[0] : null;
+  const msg0 = choice0 && typeof choice0 === "object" ? (choice0 as any).message : null;
+  const finishReason0 = typeof (choice0 as any)?.finish_reason === "string" ? String((choice0 as any).finish_reason) : "stop";
+
+  const normalizeChatToolCallsFromChatMessage = (msg: any): any[] => {
+    const out: any[] = [];
+    if (!msg || typeof msg !== "object") return out;
+
+    const normalizeArgs = (args: any): string => {
+      if (typeof args === "string") return args;
+      if (args == null) return "{}";
+      try {
+        return JSON.stringify(args);
+      } catch {
+        return "{}";
+      }
+    };
+
+    const push = (index: number, idRaw: any, nameRaw: any, argsRaw: any): void => {
+      const name = typeof nameRaw === "string" ? nameRaw.trim() : "";
+      if (!name) return;
+      const id = typeof idRaw === "string" && idRaw.trim() ? idRaw.trim() : `call_${crypto.randomUUID().replace(/-/g, "")}`;
+      out.push({
+        index,
+        id,
+        type: "function",
+        function: { name, arguments: normalizeArgs(argsRaw) },
+      });
+    };
+
+    const toolCalls = Array.isArray((msg as any).tool_calls) ? (msg as any).tool_calls : [];
+    for (let i = 0; i < toolCalls.length; i++) {
+      const tc = toolCalls[i];
+      if (!tc || typeof tc !== "object") continue;
+
+      // OpenAI chat-completions format: { id, type:"function", function:{ name, arguments } }
+      const fn = tc.function && typeof tc.function === "object" ? tc.function : null;
+      if (fn && typeof fn.name === "string") {
+        push(i, tc.id, fn.name, fn.arguments);
+        continue;
+      }
+
+      // Responses-like format (some gateways): { call_id, name, arguments }
+      if (typeof tc.name === "string") {
+        push(i, tc.call_id ?? tc.id, tc.name, tc.arguments ?? tc.args);
+        continue;
+      }
+    }
+
+    // Legacy OpenAI function_call format: { function_call:{ name, arguments } }
+    const fc = (msg as any).function_call && typeof (msg as any).function_call === "object" ? (msg as any).function_call : null;
+    if (fc && typeof fc.name === "string") {
+      push(0, (msg as any).tool_call_id ?? (msg as any).id, fc.name, fc.arguments);
+    }
+
+    return out;
+  };
+
+  const toolCalls = normalizeChatToolCallsFromChatMessage(msg0);
+  const finishReason = toolCalls.length ? "tool_calls" : finishReason0;
+
+  const roleChunk = {
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model: outModel,
+    choices: [{ index: 0, delta: { role: typeof msg0?.role === "string" ? String(msg0.role) : "assistant" }, finish_reason: null }],
+  };
+
+  const chunks: any[] = [roleChunk];
+
+  const content0 = normalizeMessageContent(msg0?.content);
+  if (typeof content0 === "string" && content0) {
+    chunks.push({
+      id,
+      object: "chat.completion.chunk",
+      created,
+      model: outModel,
+      choices: [{ index: 0, delta: { content: content0 }, finish_reason: null }],
+    });
+  }
+
+  if (toolCalls.length) {
+    chunks.push({
+      id,
+      object: "chat.completion.chunk",
+      created,
+      model: outModel,
+      choices: [{ index: 0, delta: { tool_calls: toolCalls }, finish_reason: null }],
+    });
+  }
+
+  // Best-effort: carry through common non-standard fields used by some gateways.
+  const thinking = typeof msg0?.thinking === "string" ? String(msg0.thinking) : "";
+  const reasoningContent = typeof msg0?.reasoning_content === "string" ? String(msg0.reasoning_content) : "";
+  if (thinking || reasoningContent) {
+    const d: any = {};
+    if (thinking) d.thinking = thinking;
+    if (reasoningContent) d.reasoning_content = reasoningContent;
+    chunks.push({
+      id,
+      object: "chat.completion.chunk",
+      created,
+      model: outModel,
+      choices: [{ index: 0, delta: d, finish_reason: null }],
+    });
+  }
+
+  const finalChunk = {
+    id,
+    object: "chat.completion.chunk",
+    created,
+    model: outModel,
+    choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+  };
+
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const ch of chunks) controller.enqueue(encoder.encode(encodeSseData(JSON.stringify(ch))));
+      controller.enqueue(encoder.encode(encodeSseData(JSON.stringify(finalChunk))));
+      controller.enqueue(encoder.encode(encodeSseData("[DONE]")));
+      controller.close();
+    },
+  });
 }
 
 async function isProbablyEmptyEventStream(resp) {
@@ -1825,14 +1971,17 @@ export async function handleOpenAIRequest({
   // We can still serve non-stream clients by buffering the SSE output into a single JSON response.
   const upstreamStream = true;
 
-  const headers = {
-    "content-type": "application/json",
-    accept: upstreamStream ? "text/event-stream" : "application/json",
-    authorization: `Bearer ${upstreamKey}`,
-    "x-api-key": upstreamKey,
-    "x-goog-api-key": upstreamKey,
-    "openai-beta": "responses=v1",
-  };
+  const headers = applyUpstreamCustomHeaders(
+    {
+      "content-type": "application/json",
+      accept: upstreamStream ? "text/event-stream" : "application/json",
+      authorization: `Bearer ${upstreamKey}`,
+      "x-api-key": upstreamKey,
+      "x-goog-api-key": upstreamKey,
+      "openai-beta": "responses=v1",
+    },
+    env,
+  );
   const xSessionId = request.headers.get("x-session-id");
   if (typeof xSessionId === "string" && xSessionId.trim()) headers["x-session-id"] = xSessionId.trim();
   if (debug) logDebug(debug, reqId, "openai upstream headers", { headers: redactHeadersForLog(headers) });
@@ -2907,20 +3056,34 @@ export async function handleOpenAIChatCompletionsUpstream({
   if (!upstreamUrls.length) return jsonResponse(500, jsonError("Server misconfigured: invalid OPENAI_BASE_URL", "server_error"));
   if (debug) logDebug(debug, reqId, "openai chat-completions upstream urls", { urls: upstreamUrls });
 
+  const ua = (request.headers.get("user-agent") || "").toLowerCase();
+  const isCopilotUa = ua.includes("oai-compatible-copilot/");
+  const copilotUpstreamStreamRaw = typeof (env as any)?.RSP4COPILOT_COPILOT_UPSTREAM_STREAM === "string" ? String((env as any).RSP4COPILOT_COPILOT_UPSTREAM_STREAM) : "";
+  // Default to `false` because some upstreams return `200 text/event-stream` but don't send any `data:` lines for a long time,
+  // causing Copilot clients to hang until their timeout (often ~300s).
+  const copilotUpstreamStream = copilotUpstreamStreamRaw.trim() ? parseBoolEnv(copilotUpstreamStreamRaw) : false;
+
+  const forceNonStreamUpstream = Boolean(stream) && isCopilotUa && !copilotUpstreamStream;
+  const upstreamStream = Boolean(stream) && !forceNonStreamUpstream;
+
   const body = { ...(reqJson && typeof reqJson === "object" ? reqJson : {}) };
   body.model = model;
-  body.stream = Boolean(stream);
+  body.stream = Boolean(upstreamStream);
+  if (!upstreamStream) delete (body as any).stream_options;
   for (const k of Object.keys(body)) {
     if (k.startsWith("__")) delete body[k];
   }
 
-  const headers = {
-    "content-type": "application/json",
-    accept: stream ? "text/event-stream" : "application/json",
-    authorization: `Bearer ${upstreamKey}`,
-    "x-api-key": upstreamKey,
-    "x-goog-api-key": upstreamKey,
-  };
+  const headers = applyUpstreamCustomHeaders(
+    {
+      "content-type": "application/json",
+      accept: upstreamStream ? "text/event-stream" : "application/json",
+      authorization: `Bearer ${upstreamKey}`,
+      "x-api-key": upstreamKey,
+      "x-goog-api-key": upstreamKey,
+    },
+    env,
+  );
   const xSessionId = request.headers.get("x-session-id");
   if (typeof xSessionId === "string" && xSessionId.trim()) headers["x-session-id"] = xSessionId.trim();
   if (debug) logDebug(debug, reqId, "openai chat-completions upstream headers", { headers: redactHeadersForLog(headers) });
@@ -2941,6 +3104,33 @@ export async function handleOpenAIChatCompletionsUpstream({
 
   const resp = sel.resp;
   if (stream) {
+    if (!upstreamStream) {
+      const text = await resp.text().catch(() => "");
+      if (!resp.ok || resp.status >= 400) {
+        return new Response(text, {
+          status: resp.status || 500,
+          headers: { "content-type": resp.headers.get("content-type") || "application/json; charset=utf-8" },
+        });
+      }
+      let parsed: any = null;
+      try {
+        parsed = text ? JSON.parse(text) : null;
+      } catch {
+        parsed = null;
+      }
+      if (!parsed || typeof parsed !== "object") {
+        return jsonResponse(502, jsonError("Upstream returned invalid JSON", "bad_gateway"));
+      }
+      if (debug) {
+        logDebug(debug, reqId, "openai upstream streaming disabled", {
+          reason: "oai-compatible-copilot user-agent",
+          upstreamUrl: sel.upstreamUrl,
+        });
+      }
+      const readable = buildChatCompletionsSseFromNonStreamJson(parsed, model);
+      return new Response(readable, { status: 200, headers: sseHeaders({ "x-rsp4copilot-upstream-stream": "0" }) });
+    }
+
     return new Response(resp.body, { status: resp.status, headers: sseHeaders() });
   }
 
@@ -2989,14 +3179,17 @@ export async function handleOpenAIResponsesUpstream({
   // We can still serve non-stream clients by buffering the SSE output into a single JSON response.
   const upstreamStream = true;
 
-  const headers = {
-    "content-type": "application/json",
-    accept: upstreamStream ? "text/event-stream" : "application/json",
-    authorization: `Bearer ${upstreamKey}`,
-    "x-api-key": upstreamKey,
-    "x-goog-api-key": upstreamKey,
-    "openai-beta": "responses=v1",
-  };
+  const headers = applyUpstreamCustomHeaders(
+    {
+      "content-type": "application/json",
+      accept: upstreamStream ? "text/event-stream" : "application/json",
+      authorization: `Bearer ${upstreamKey}`,
+      "x-api-key": upstreamKey,
+      "x-goog-api-key": upstreamKey,
+      "openai-beta": "responses=v1",
+    },
+    env,
+  );
   const xSessionId = request.headers.get("x-session-id");
   if (typeof xSessionId === "string" && xSessionId.trim()) headers["x-session-id"] = xSessionId.trim();
   if (debug) logDebug(debug, reqId, "openai upstream headers", { headers: redactHeadersForLog(headers) });

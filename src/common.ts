@@ -1,4 +1,56 @@
+import { parseJsonc } from "./jsonc";
+
 export type Env = Record<string, string | undefined>;
+
+const DEFAULT_UPSTREAM_CUSTOM_HEADERS: Record<string, string> = {
+  "user-agent": "codex_cli_rs/0.79.0 (Windows 10.0.26100; x86_64) unknown",
+  originator: "codex_cli_rs",
+};
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+export function parseUpstreamCustomHeaders(env: Env): Record<string, string> {
+  const raw = typeof env?.RSP4COPILOT_UPSTREAM_HEADERS === "string" ? env.RSP4COPILOT_UPSTREAM_HEADERS : "";
+  const text = raw.trim();
+  if (!text) return {};
+  const parsed = parseJsonc(text);
+  if (!parsed.ok || !isPlainObject(parsed.value)) return {};
+
+  const out: Record<string, string> = {};
+  for (const [k0, v0] of Object.entries(parsed.value)) {
+    const key = String(k0 ?? "")
+      .trim()
+      .toLowerCase();
+    if (!key) continue;
+    if (v0 == null) continue;
+    const value = String(v0).trim();
+    if (!value) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+export function applyUpstreamCustomHeaders(headers: Record<string, string>, env: Env): Record<string, string> {
+  const custom = parseUpstreamCustomHeaders(env);
+
+  const base: Record<string, string> = {};
+  for (const [k0, v0] of Object.entries(headers || {})) {
+    const key = String(k0 ?? "")
+      .trim()
+      .toLowerCase();
+    if (!key) continue;
+    if (v0 == null) continue;
+    base[key] = String(v0);
+  }
+
+  // Merge order (later wins):
+  // - base: provider-required defaults (auth/content-type/etc)
+  // - DEFAULT_UPSTREAM_CUSTOM_HEADERS: auto-added "Codex-ish" headers
+  // - custom: user-configured overrides (env/config)
+  return { ...base, ...DEFAULT_UPSTREAM_CUSTOM_HEADERS, ...custom };
+}
 
 export function jsonResponse(status: number, obj: unknown, extraHeaders: Record<string, unknown> | undefined = undefined): Response {
   const headers: Record<string, string> = {
@@ -32,7 +84,16 @@ export function joinUrls(urls: unknown): string {
 }
 
 export function parseBoolEnv(value: unknown): boolean {
-  const v = typeof value === "string" ? value.trim().toLowerCase() : "";
+  let v0 = typeof value === "string" ? value.trim() : "";
+  // Accept quoted dotenv values like "true" / 'true'.
+  for (let i = 0; i < 2; i++) {
+    if ((v0.startsWith('"') && v0.endsWith('"')) || (v0.startsWith("'") && v0.endsWith("'"))) {
+      v0 = v0.slice(1, -1).trim();
+      continue;
+    }
+    break;
+  }
+  const v = v0.toLowerCase();
   if (!v) return false;
   return v === "1" || v === "true" || v === "yes" || v === "y" || v === "on";
 }
@@ -408,6 +469,58 @@ export function bearerToken(headerValue: unknown): string | null {
   const value = headerValue.trim();
   if (value.toLowerCase().startsWith("bearer ")) return value.slice(7).trim();
   return null;
+}
+
+export function parseCsvEnv(raw: unknown): string[] {
+  const s = typeof raw === "string" ? raw : "";
+  const out: string[] = [];
+  for (const part of s.split(",")) {
+    const v = String(part ?? "").trim();
+    if (!v) continue;
+    out.push(v);
+  }
+  return out;
+}
+
+function ipv4ToU32(ip: string): number | null {
+  const parts = ip.trim().split(".");
+  if (parts.length !== 4) return null;
+  let out = 0;
+  for (const p of parts) {
+    if (!/^\d+$/.test(p)) return null;
+    const n = Number(p);
+    if (!Number.isFinite(n) || n < 0 || n > 255) return null;
+    out = (out << 8) | n;
+  }
+  // Force unsigned.
+  return out >>> 0;
+}
+
+function matchIpv4Cidr(ip: string, cidr: string): boolean {
+  const [baseRaw, bitsRaw] = cidr.split("/");
+  const base = ipv4ToU32(baseRaw || "");
+  const target = ipv4ToU32(ip);
+  const bits = Number(bitsRaw);
+  if (base == null || target == null) return false;
+  if (!Number.isFinite(bits) || bits < 0 || bits > 32) return false;
+  const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+  return (base & mask) === (target & mask);
+}
+
+export function isClientIpAllowed(clientIp: string, allowed: string[]): boolean {
+  if (!allowed.length) return true;
+  const ip = String(clientIp || "").trim();
+  if (!ip) return false;
+  for (const ruleRaw of allowed) {
+    const rule = String(ruleRaw || "").trim();
+    if (!rule) continue;
+    if (rule.includes("/") && rule.includes(".")) {
+      if (matchIpv4Cidr(ip, rule)) return true;
+      continue;
+    }
+    if (rule === ip) return true;
+  }
+  return false;
 }
 
 export function normalizeBaseUrl(raw: unknown): string {

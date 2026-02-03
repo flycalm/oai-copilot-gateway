@@ -13,6 +13,12 @@
 
 # Config-driven routing (required)
 # One-line JSON is easiest for .dev.vars; for production prefer the multi-line TOML string in `wrangler.toml.example`.
+#
+# Single-upstream example:
+# RSP4COPILOT_CONFIG={"version":1,"providers":{"openai":{"apiMode":"openai-responses","baseURL":"https://your-relay.example/openai","apiKey":"REPLACE_ME","models":{"gpt-5.2":{"upstreamModel":"gpt-5.2"}}}}}
+#
+# Multi-upstream aggregation example (round-robin):
+# RSP4COPILOT_CONFIG={"version":1,"providers":{"openai":{"apiMode":"openai-responses","routing":{"strategy":"round_robin"},"upstreams":[{"id":"relay-a","baseURL":"https://relay-a.example/openai","apiKey":"REPLACE_ME"},{"id":"relay-b","baseURL":"https://relay-b.example/openai","apiKey":"REPLACE_ME"}],"models":{"gpt-5.2":{"upstreamModel":"gpt-5.2"}}}}}
 RSP4COPILOT_CONFIG={"version":1,"providers":{"openai":{"apiMode":"openai-responses","baseURL":"https://your-relay.example/openai","apiKey":"REPLACE_ME","models":{"gpt-5.2":{"upstreamModel":"gpt-5.2"}}}}}
 
 # Debug logging

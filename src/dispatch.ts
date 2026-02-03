@@ -1,10 +1,10 @@
-import { joinUrls, jsonError, jsonResponse, normalizeAuthValue } from "./common";
+import { joinUrls, jsonError, jsonResponse, normalizeAuthValue, parseUpstreamCustomHeaders } from "./common";
 import type { Env } from "./common";
 import type { GatewayConfig, ModelConfig, ProviderConfig } from "./config";
-import { getProviderApiKey } from "./config";
 import { handleClaudeChatCompletions } from "./providers/claude";
 import { handleGeminiChatCompletions } from "./providers/gemini";
 import { handleOpenAIChatCompletionsUpstream, handleOpenAIRequest } from "./providers/openai";
+import { listUpstreamCandidates, shouldTryNextUpstreamCandidateStatus } from "./upstreams";
 
 function envWithOverrides(env: Env, overrides: Record<string, string> | null): Env {
   const base = env && typeof env === "object" ? env : {};
@@ -53,127 +53,177 @@ export async function dispatchOpenAIChatToProvider({
   startedAt?: number;
   extraSystemText: string;
 }): Promise<Response> {
-  const apiKey = getProviderApiKey(env, provider);
-  if (!apiKey) return jsonResponse(500, jsonError(`Server misconfigured: missing upstream API key for provider ${provider.id}`, "server_error"));
+  const upstreamCandidates = listUpstreamCandidates({ env, provider, request, reqId });
+  if (!upstreamCandidates.length) {
+    return jsonResponse(500, jsonError(`Server misconfigured: missing upstream API key for provider ${provider.id}`, "server_error"));
+  }
 
+  const inheritedCustomHeaders = parseUpstreamCustomHeaders(env);
   const providerApiMode = typeof provider.apiMode === "string" ? provider.apiMode.trim() : "";
 
-  if (providerApiMode === "openai-responses") {
-    const quirks = provider.quirks || {};
-    const providerOpts = provider?.options || {};
-    const modelOpts = model?.options || {};
-    const responsesPath =
-      (provider.endpoints && typeof (provider.endpoints as any).responsesPath === "string" && String((provider.endpoints as any).responsesPath).trim()) ||
-      (provider.endpoints && typeof (provider.endpoints as any).responses_path === "string" && String((provider.endpoints as any).responses_path).trim()) ||
-      "";
+  let lastResp: Response | null = null;
+  for (let i = 0; i < upstreamCandidates.length; i++) {
+    const upstream = upstreamCandidates[i];
+    const apiKey = upstream.apiKey;
+    const upstreamHeaders =
+      upstream.customHeader && Object.keys(upstream.customHeader).length ? { ...inheritedCustomHeaders, ...upstream.customHeader } : null;
+    const upstreamHeadersEnv =
+      upstreamHeaders && Object.keys(upstreamHeaders).length ? JSON.stringify(upstreamHeaders) : "";
 
-    const upstreamUrls = joinUrls(provider.baseURLs);
-    const noInstructionsUrls = truthy((quirks as any).noInstructions) ? upstreamUrls : "";
-    const noPrevUrls = truthy((quirks as any).noPreviousResponseId) ? upstreamUrls : "";
-    const reasoningEffort = typeof (modelOpts as any).reasoningEffort === "string" ? String((modelOpts as any).reasoningEffort).trim() : "";
-    const maxInstructionsChars = pickNumber((modelOpts as any).maxInstructionsChars, (providerOpts as any).maxInstructionsChars);
+    if (providerApiMode === "openai-responses") {
+      const quirks = upstream.quirks || {};
+      const providerOpts = upstream.options || {};
+      const modelOpts = model?.options || {};
+      const responsesPath =
+        (upstream.endpoints && typeof (upstream.endpoints as any).responsesPath === "string" && String((upstream.endpoints as any).responsesPath).trim()) ||
+        (upstream.endpoints && typeof (upstream.endpoints as any).responses_path === "string" && String((upstream.endpoints as any).responses_path).trim()) ||
+        "";
 
-    const env2 = envWithOverrides(env, {
-      OPENAI_BASE_URL: upstreamUrls,
-      OPENAI_API_KEY: apiKey,
-      ...(responsesPath ? { RESP_RESPONSES_PATH: responsesPath } : null),
-      ...(noInstructionsUrls ? { RESP_NO_INSTRUCTIONS_URLS: noInstructionsUrls } : null),
-      ...(noPrevUrls ? { RESP_NO_PREVIOUS_RESPONSE_ID_URLS: noPrevUrls } : null),
-      ...(reasoningEffort ? { RESP_REASONING_EFFORT: reasoningEffort } : null),
-      ...(maxInstructionsChars != null ? { RESP_MAX_INSTRUCTIONS_CHARS: String(maxInstructionsChars) } : null),
-    });
+      const upstreamUrls = joinUrls(upstream.baseURLs);
+      const noInstructionsUrls = truthy((quirks as any).noInstructions) ? upstreamUrls : "";
+      const noPrevUrls = truthy((quirks as any).noPreviousResponseId) ? upstreamUrls : "";
+      const reasoningEffort = typeof (modelOpts as any).reasoningEffort === "string" ? String((modelOpts as any).reasoningEffort).trim() : "";
+      const maxInstructionsChars = pickNumber((modelOpts as any).maxInstructionsChars, (providerOpts as any).maxInstructionsChars);
 
-    const resp = await handleOpenAIRequest({
-      request,
-      env: env2,
-      reqJson,
-      model: model.upstreamModel,
-      stream,
-      token: normalizeAuthValue(token),
-      debug,
-      reqId,
-      path: typeof path === "string" ? path : "",
-      startedAt: typeof startedAt === "number" && Number.isFinite(startedAt) ? startedAt : Date.now(),
-      isTextCompletions: false,
-      extraSystemText,
-    });
+      const env2 = envWithOverrides(env, {
+        OPENAI_BASE_URL: upstreamUrls,
+        OPENAI_API_KEY: apiKey,
+        ...(upstreamHeadersEnv ? { RSP4COPILOT_UPSTREAM_HEADERS: upstreamHeadersEnv } : null),
+        ...(responsesPath ? { RESP_RESPONSES_PATH: responsesPath } : null),
+        ...(noInstructionsUrls ? { RESP_NO_INSTRUCTIONS_URLS: noInstructionsUrls } : null),
+        ...(noPrevUrls ? { RESP_NO_PREVIOUS_RESPONSE_ID_URLS: noPrevUrls } : null),
+        ...(reasoningEffort ? { RESP_REASONING_EFFORT: reasoningEffort } : null),
+        ...(maxInstructionsChars != null ? { RESP_MAX_INSTRUCTIONS_CHARS: String(maxInstructionsChars) } : null),
+      });
 
-    return resp;
+      const resp = await handleOpenAIRequest({
+        request,
+        env: env2,
+        reqJson,
+        model: model.upstreamModel,
+        stream,
+        token: normalizeAuthValue(token),
+        debug,
+        reqId,
+        path: typeof path === "string" ? path : "",
+        startedAt: typeof startedAt === "number" && Number.isFinite(startedAt) ? startedAt : Date.now(),
+        isTextCompletions: false,
+        extraSystemText,
+      });
+
+      lastResp = resp;
+      if (resp.ok) return resp;
+      if (!shouldTryNextUpstreamCandidateStatus(resp.status) || i === upstreamCandidates.length - 1) return resp;
+      continue;
+    }
+
+    if (providerApiMode === "openai-chat-completions") {
+      const providerOpts = upstream.options || {};
+      const modelOpts = model?.options || {};
+      const chatCompletionsPath =
+        (upstream.endpoints &&
+          typeof (upstream.endpoints as any).chatCompletionsPath === "string" &&
+          String((upstream.endpoints as any).chatCompletionsPath).trim()) ||
+        (upstream.endpoints &&
+          typeof (upstream.endpoints as any).chat_completions_path === "string" &&
+          String((upstream.endpoints as any).chat_completions_path).trim()) ||
+        "";
+      const maxInstructionsChars = pickNumber((modelOpts as any).maxInstructionsChars, (providerOpts as any).maxInstructionsChars);
+
+      const env2 = envWithOverrides(env, {
+        OPENAI_BASE_URL: joinUrls(upstream.baseURLs),
+        OPENAI_API_KEY: apiKey,
+        ...(upstreamHeadersEnv ? { RSP4COPILOT_UPSTREAM_HEADERS: upstreamHeadersEnv } : null),
+        ...(chatCompletionsPath ? { OPENAI_CHAT_COMPLETIONS_PATH: chatCompletionsPath } : null),
+        ...(maxInstructionsChars != null ? { RESP_MAX_INSTRUCTIONS_CHARS: String(maxInstructionsChars) } : null),
+      });
+
+      const resp = await handleOpenAIChatCompletionsUpstream({
+        request,
+        env: env2,
+        reqJson,
+        model: model.upstreamModel,
+        stream,
+        token: normalizeAuthValue(token),
+        debug,
+        reqId,
+        path: typeof path === "string" ? path : "",
+        startedAt: typeof startedAt === "number" && Number.isFinite(startedAt) ? startedAt : Date.now(),
+        extraSystemText,
+      });
+
+      lastResp = resp;
+      if (resp.ok) return resp;
+      if (!shouldTryNextUpstreamCandidateStatus(resp.status) || i === upstreamCandidates.length - 1) return resp;
+      continue;
+    }
+
+    if (providerApiMode === "claude") {
+      const providerOpts = upstream.options || {};
+      const modelOpts = model?.options || {};
+      const messagesPath =
+        upstream.endpoints && typeof (upstream.endpoints as any).messagesPath === "string" ? String((upstream.endpoints as any).messagesPath).trim() : "";
+      const claudeMaxTokens = pickNumber(
+        (modelOpts as any).maxTokens,
+        (modelOpts as any).maxOutputTokens,
+        (providerOpts as any).maxTokens,
+        (providerOpts as any).maxOutputTokens,
+      );
+      const env2 = envWithOverrides(env, {
+        CLAUDE_BASE_URL: joinUrls(upstream.baseURLs),
+        CLAUDE_API_KEY: apiKey,
+        ...(upstreamHeadersEnv ? { RSP4COPILOT_UPSTREAM_HEADERS: upstreamHeadersEnv } : null),
+        ...(messagesPath ? { CLAUDE_MESSAGES_PATH: messagesPath } : null),
+        ...(claudeMaxTokens != null ? { CLAUDE_MAX_TOKENS: String(claudeMaxTokens) } : null),
+      });
+
+      const resp = await handleClaudeChatCompletions({
+        request,
+        env: env2,
+        reqJson,
+        model: model.upstreamModel,
+        stream,
+        debug,
+        reqId,
+        extraSystemText,
+      });
+
+      lastResp = resp;
+      if (resp.ok) return resp;
+      if (!shouldTryNextUpstreamCandidateStatus(resp.status) || i === upstreamCandidates.length - 1) return resp;
+      continue;
+    }
+
+    if (providerApiMode === "gemini") {
+      const env2 = envWithOverrides(env, {
+        GEMINI_BASE_URL: joinUrls(upstream.baseURLs),
+        GEMINI_API_KEY: apiKey,
+        ...(upstreamHeadersEnv ? { RSP4COPILOT_UPSTREAM_HEADERS: upstreamHeadersEnv } : null),
+      });
+
+      const resp = await handleGeminiChatCompletions({
+        request,
+        env: env2,
+        reqJson,
+        model: model.upstreamModel,
+        stream,
+        token: normalizeAuthValue(token),
+        debug,
+        reqId,
+        extraSystemText,
+      });
+
+      lastResp = resp;
+      if (resp.ok) return resp;
+      if (!shouldTryNextUpstreamCandidateStatus(resp.status) || i === upstreamCandidates.length - 1) return resp;
+      continue;
+    }
+
+    return jsonResponse(500, jsonError(`Unsupported provider apiMode: ${providerApiMode}`, "server_error"));
   }
 
-  if (providerApiMode === "openai-chat-completions") {
-    const providerOpts = provider?.options || {};
-    const modelOpts = model?.options || {};
-    const chatCompletionsPath =
-      (provider.endpoints && typeof (provider.endpoints as any).chatCompletionsPath === "string" && String((provider.endpoints as any).chatCompletionsPath).trim()) ||
-      (provider.endpoints && typeof (provider.endpoints as any).chat_completions_path === "string" && String((provider.endpoints as any).chat_completions_path).trim()) ||
-      "";
-    const maxInstructionsChars = pickNumber((modelOpts as any).maxInstructionsChars, (providerOpts as any).maxInstructionsChars);
-
-    const env2 = envWithOverrides(env, {
-      OPENAI_BASE_URL: joinUrls(provider.baseURLs),
-      OPENAI_API_KEY: apiKey,
-      ...(chatCompletionsPath ? { OPENAI_CHAT_COMPLETIONS_PATH: chatCompletionsPath } : null),
-      ...(maxInstructionsChars != null ? { RESP_MAX_INSTRUCTIONS_CHARS: String(maxInstructionsChars) } : null),
-    });
-
-    return await handleOpenAIChatCompletionsUpstream({
-      request,
-      env: env2,
-      reqJson,
-      model: model.upstreamModel,
-      stream,
-      token: normalizeAuthValue(token),
-      debug,
-      reqId,
-      path: typeof path === "string" ? path : "",
-      startedAt: typeof startedAt === "number" && Number.isFinite(startedAt) ? startedAt : Date.now(),
-      extraSystemText,
-    });
-  }
-
-  if (providerApiMode === "claude") {
-    const providerOpts = provider?.options || {};
-    const modelOpts = model?.options || {};
-    const messagesPath = provider.endpoints && typeof (provider.endpoints as any).messagesPath === "string" ? String((provider.endpoints as any).messagesPath).trim() : "";
-    const claudeMaxTokens = pickNumber((modelOpts as any).maxTokens, (modelOpts as any).maxOutputTokens, (providerOpts as any).maxTokens, (providerOpts as any).maxOutputTokens);
-    const env2 = envWithOverrides(env, {
-      CLAUDE_BASE_URL: joinUrls(provider.baseURLs),
-      CLAUDE_API_KEY: apiKey,
-      ...(messagesPath ? { CLAUDE_MESSAGES_PATH: messagesPath } : null),
-      ...(claudeMaxTokens != null ? { CLAUDE_MAX_TOKENS: String(claudeMaxTokens) } : null),
-    });
-
-    return await handleClaudeChatCompletions({
-      request,
-      env: env2,
-      reqJson,
-      model: model.upstreamModel,
-      stream,
-      debug,
-      reqId,
-      extraSystemText,
-    });
-  }
-
-  if (providerApiMode === "gemini") {
-    const env2 = envWithOverrides(env, {
-      GEMINI_BASE_URL: joinUrls(provider.baseURLs),
-      GEMINI_API_KEY: apiKey,
-    });
-
-    return await handleGeminiChatCompletions({
-      request,
-      env: env2,
-      reqJson,
-      model: model.upstreamModel,
-      stream,
-      token: normalizeAuthValue(token),
-      debug,
-      reqId,
-      extraSystemText,
-    });
-  }
-
-  return jsonResponse(500, jsonError(`Unsupported provider apiMode: ${providerApiMode}`, "server_error"));
+  return (
+    lastResp ||
+    jsonResponse(500, jsonError(`Server misconfigured: missing upstream API key for provider ${provider.id}`, "server_error"))
+  );
 }

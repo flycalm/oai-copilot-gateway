@@ -118,4 +118,3 @@ export function openAIChatResponseToGemini(chatJson: unknown): Record<string, un
         : undefined,
   };
 }
-

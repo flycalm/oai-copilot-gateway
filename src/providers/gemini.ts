@@ -1,5 +1,6 @@
 import {
   appendInstructions,
+  applyUpstreamCustomHeaders,
   encodeSseData,
   getSessionKey,
   getRsp4CopilotLimits,
@@ -19,6 +20,7 @@ import {
   sseHeaders,
   trimOpenAIChatMessages,
 } from "../common";
+import { shouldTryNextUpstreamCandidateStatus } from "../upstreams";
 
 export function isGeminiModelId(modelId) {
   const v = typeof modelId === "string" ? modelId.trim().toLowerCase() : "";
@@ -999,14 +1001,14 @@ async function setThoughtSignatureCache(sessionKey, callId, thoughtSignature, th
 }
 
 export async function handleGeminiChatCompletions({ request, env, reqJson, model, stream, token, debug, reqId, extraSystemText }) {
-  const geminiBase = normalizeAuthValue(env.GEMINI_BASE_URL);
+  const geminiBases = splitCommaSeparatedUrls(normalizeAuthValue(env.GEMINI_BASE_URL));
   const geminiKey = normalizeAuthValue(env.GEMINI_API_KEY);
-  if (!geminiBase) return jsonResponse(500, jsonError("Server misconfigured: missing GEMINI_BASE_URL", "server_error"));
+  if (!geminiBases.length) return jsonResponse(500, jsonError("Server misconfigured: missing GEMINI_BASE_URL", "server_error"));
   if (!geminiKey) return jsonResponse(500, jsonError("Server misconfigured: missing GEMINI_API_KEY", "server_error"));
 
   const geminiModelId = normalizeGeminiModelId(model, env);
-  const geminiUrl = buildGeminiGenerateContentUrl(geminiBase, geminiModelId, stream);
-  if (!geminiUrl) return jsonResponse(500, jsonError("Server misconfigured: invalid GEMINI_BASE_URL", "server_error"));
+  let geminiBase = "";
+  let geminiUrl = "";
 
   const sessionKey = getSessionKey(request, reqJson, token);
   const thoughtSigCache = sessionKey ? await getThoughtSignatureCache(sessionKey) : {};
@@ -1039,12 +1041,14 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
 
   // Match Gemini's official auth style (and oai-compatible-copilot): API key in `x-goog-api-key`.
   // Some proxies mis-handle `Authorization` for Gemini and may return empty candidates.
-  const geminiHeaders = {
-    "Content-Type": "application/json",
-    Accept: stream ? "text/event-stream" : "application/json",
-    "User-Agent": "rsp4copilot",
-    "x-goog-api-key": geminiKey,
-  };
+  const geminiHeaders = applyUpstreamCustomHeaders(
+    {
+      "content-type": "application/json",
+      accept: stream ? "text/event-stream" : "application/json",
+      "x-goog-api-key": geminiKey,
+    },
+    env,
+  );
   const xSessionId = request.headers.get("x-session-id");
   if (typeof xSessionId === "string" && xSessionId.trim()) geminiHeaders["x-session-id"] = xSessionId.trim();
 
@@ -1064,29 +1068,57 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
   }
 
   let gemResp;
-  try {
-    const t0 = Date.now();
-    gemResp = await fetch(geminiUrl, { method: "POST", headers: geminiHeaders, body: JSON.stringify(geminiBody) });
-    if (debug) {
-      logDebug(debug, reqId, "gemini response headers", {
-        status: gemResp.status,
-        ok: gemResp.ok,
-        contentType: gemResp.headers.get("content-type") || "",
-        elapsedMs: Date.now() - t0,
-      });
+  let lastFetchError: string | null = null;
+  let lastErrStatus: number | null = null;
+  let lastErrText: string | null = null;
+  for (const base of geminiBases) {
+    const urlTry = buildGeminiGenerateContentUrl(base, geminiModelId, stream);
+    if (!urlTry) continue;
+
+    try {
+      const t0 = Date.now();
+      const respTry = await fetch(urlTry, { method: "POST", headers: geminiHeaders, body: JSON.stringify(geminiBody) });
+      if (debug) {
+        logDebug(debug, reqId, "gemini response headers", {
+          url: urlTry,
+          status: respTry.status,
+          ok: respTry.ok,
+          contentType: respTry.headers.get("content-type") || "",
+          elapsedMs: Date.now() - t0,
+        });
+      }
+
+      gemResp = respTry;
+      geminiBase = base;
+      geminiUrl = urlTry;
+      if (respTry.ok) break;
+
+      // Read the error body so we can decide whether to try the next base.
+      let rawErr = "";
+      try {
+        rawErr = await respTry.text();
+      } catch { }
+      lastErrStatus = respTry.status;
+      lastErrText = rawErr;
+
+      if (!shouldTryNextUpstreamCandidateStatus(respTry.status)) break;
+      continue;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "fetch failed";
+      lastFetchError = message;
+      if (debug) logDebug(debug, reqId, "gemini fetch error", { url: urlTry, error: message });
+      continue;
     }
-  } catch (err) {
-    const message = err instanceof Error ? err.message : "fetch failed";
-    if (debug) logDebug(debug, reqId, "gemini fetch error", { error: message });
-    return jsonResponse(502, jsonError(`Upstream fetch failed: ${message}`, "bad_gateway"));
+  }
+
+  if (!gemResp) {
+    const message = lastFetchError ? `Upstream fetch failed: ${lastFetchError}` : "Server misconfigured: invalid GEMINI_BASE_URL";
+    return jsonResponse(502, jsonError(message, "bad_gateway"));
   }
 
   if (!gemResp.ok) {
-    let rawErr = "";
-    try {
-      rawErr = await gemResp.text();
-    } catch { }
-    if (debug) logDebug(debug, reqId, "gemini upstream error", { status: gemResp.status, errorPreview: previewString(rawErr, 1200) });
+    const rawErr = lastErrText ?? "";
+    if (debug) logDebug(debug, reqId, "gemini upstream error", { url: geminiUrl, status: gemResp.status, errorPreview: previewString(rawErr, 1200) });
     let message = `Gemini upstream error (status ${gemResp.status})`;
     try {
       const obj = JSON.parse(rawErr);
@@ -1219,7 +1251,7 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
     // retry once via SSE and assemble a non-stream Chat Completions response.
     if (shouldRetryEmpty(extracted)) {
       const streamUrl = buildGeminiGenerateContentUrl(geminiBase, geminiModelId, true);
-      const streamHeaders = { ...geminiHeaders, Accept: "text/event-stream" };
+      const streamHeaders = { ...geminiHeaders, accept: "text/event-stream" };
 
       const tryStreamFallback = async (label, bodyOverride) => {
         if (!streamUrl || !bodyOverride || typeof bodyOverride !== "object") return null;
@@ -1837,7 +1869,7 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
       const sawAnyMeaningful = Boolean(textSoFar) || toolCallKeyToMeta.size > 0 || sawAnyReasoning;
       if (!sawAnyMeaningful) {
         const nonStreamUrl = buildGeminiGenerateContentUrl(geminiBase, geminiModelId, false);
-        const nonStreamHeaders = { ...geminiHeaders, Accept: "application/json" };
+        const nonStreamHeaders = { ...geminiHeaders, accept: "application/json" };
 
         const isExtractedEmpty = (extracted) => {
           if (!extracted || typeof extracted !== "object") return true;
@@ -2059,12 +2091,14 @@ export async function handleGeminiGenerateContentUpstream({
   if (!normContents.ok) return jsonResponse(400, jsonError(normContents.error, "invalid_request_error"));
   (body as any).contents = normContents.contents;
 
-  const headers = {
-    "Content-Type": "application/json",
-    Accept: stream ? "text/event-stream" : "application/json",
-    "User-Agent": "rsp4copilot",
-    "x-goog-api-key": geminiKey,
-  };
+  const headers = applyUpstreamCustomHeaders(
+    {
+      "content-type": "application/json",
+      accept: stream ? "text/event-stream" : "application/json",
+      "x-goog-api-key": geminiKey,
+    },
+    env,
+  );
   const xSessionId = request?.headers?.get?.("x-session-id");
   if (typeof xSessionId === "string" && xSessionId.trim()) headers["x-session-id"] = xSessionId.trim();
 

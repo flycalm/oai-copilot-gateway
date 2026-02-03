@@ -1,5 +1,11 @@
 import { jsonError } from "./common";
 import type { GatewayConfig, ModelConfig, ProviderConfig } from "./config";
+import { findProvidersForDiscoveredModel, hasDiscoveredModel } from "./models_discovery_cache";
+
+function buildDynamicModelConfig(modelName: string): ModelConfig {
+  const name = String(modelName || "").trim();
+  return { name, upstreamModel: name, options: {}, quirks: {} };
+}
 
 export function splitProviderModel(
   modelId: unknown,
@@ -73,10 +79,11 @@ export function resolveModel(
       const sel = matchProviderByHint(config, maybeProvider);
       if (sel.ok) {
         const model = sel.provider.models[maybeModelName];
-        if (!model) {
-          return { ok: false, status: 400, error: jsonError(`Unknown model for provider ${sel.providerId}: ${maybeModelName}`, "invalid_request_error") };
+        if (model) return { ok: true, providerId: sel.providerId, modelName: maybeModelName, provider: sel.provider, model };
+        if ((sel.provider as any)?.discoverModels) {
+          return { ok: true, providerId: sel.providerId, modelName: maybeModelName, provider: sel.provider, model: buildDynamicModelConfig(maybeModelName) };
         }
-        return { ok: true, providerId: sel.providerId, modelName: maybeModelName, provider: sel.provider, model };
+        return { ok: false, status: 400, error: jsonError(`Unknown model for provider ${sel.providerId}: ${maybeModelName}`, "invalid_request_error") };
       }
     }
   }
@@ -89,8 +96,11 @@ export function resolveModel(
     const sel = matchProviderByHint(config, hint);
     if (!sel.ok) return { ok: false, status: 400, error: jsonError(sel.error, "invalid_request_error") };
     const model = sel.provider.models[modelName];
-    if (!model) return { ok: false, status: 400, error: jsonError(`Unknown model for provider ${sel.providerId}: ${modelName}`, "invalid_request_error") };
-    return { ok: true, providerId: sel.providerId, modelName, provider: sel.provider, model };
+    if (model) return { ok: true, providerId: sel.providerId, modelName, provider: sel.provider, model };
+    if ((sel.provider as any)?.discoverModels) {
+      return { ok: true, providerId: sel.providerId, modelName, provider: sel.provider, model: buildDynamicModelConfig(modelName) };
+    }
+    return { ok: false, status: 400, error: jsonError(`Unknown model for provider ${sel.providerId}: ${modelName}`, "invalid_request_error") };
   }
 
   // No provider hint: infer from config (must be unique)
@@ -100,7 +110,36 @@ export function resolveModel(
     if (m) matches.push({ providerId, provider, model: m });
   }
 
-  if (!matches.length) return { ok: false, status: 400, error: jsonError(`Unknown model: ${modelName}`, "invalid_request_error") };
+  if (!matches.length) {
+    const discoveredProviders = findProvidersForDiscoveredModel(modelName).filter((pid) => {
+      const p = config.providers?.[pid];
+      return Boolean(p && (p as any)?.discoverModels && hasDiscoveredModel(pid, modelName));
+    });
+
+    if (discoveredProviders.length === 1) {
+      const providerId = discoveredProviders[0];
+      const provider = config.providers[providerId];
+      return { ok: true, providerId, modelName, provider, model: buildDynamicModelConfig(modelName) };
+    }
+    if (discoveredProviders.length > 1) {
+      return {
+        ok: false,
+        status: 400,
+        error: jsonError(`Ambiguous model: ${modelName} (provide 'provider' or use providerId.modelName)`, "invalid_request_error"),
+      };
+    }
+
+    const dynamicProviders = Object.entries(config.providers)
+      .filter(([, p]) => Boolean((p as any)?.discoverModels))
+      .map(([pid]) => pid);
+    if (dynamicProviders.length === 1) {
+      const providerId = dynamicProviders[0];
+      const provider = config.providers[providerId];
+      return { ok: true, providerId, modelName, provider, model: buildDynamicModelConfig(modelName) };
+    }
+
+    return { ok: false, status: 400, error: jsonError(`Unknown model: ${modelName}`, "invalid_request_error") };
+  }
   if (matches.length > 1) {
     return {
       ok: false,

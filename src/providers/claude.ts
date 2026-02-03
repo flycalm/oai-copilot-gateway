@@ -1,5 +1,6 @@
 import {
   appendInstructions,
+  applyUpstreamCustomHeaders,
   applyTemperatureTopPFromRequest,
   encodeSseData,
   getRsp4CopilotLimits,
@@ -296,12 +297,15 @@ export async function handleClaudeChatCompletions({ request, env, reqJson, model
   if (claudeTools.length) claudeBody.tools = claudeTools;
   applyTemperatureTopPFromRequest(reqJson, claudeBody);
 
-  const claudeHeaders = {
-    "content-type": "application/json",
-    authorization: `Bearer ${claudeKey}`,
-    "x-api-key": claudeKey,
-    "anthropic-version": "2023-06-01",
-  };
+  const claudeHeaders = applyUpstreamCustomHeaders(
+    {
+      "content-type": "application/json",
+      authorization: `Bearer ${claudeKey}`,
+      "x-api-key": claudeKey,
+      "anthropic-version": "2023-06-01",
+    },
+    env,
+  );
   if (claudeTools.length) claudeHeaders["anthropic-beta"] = "tools-2024-04-04";
   const xSessionId = request?.headers?.get?.("x-session-id");
   if (typeof xSessionId === "string" && xSessionId.trim()) claudeHeaders["x-session-id"] = xSessionId.trim();

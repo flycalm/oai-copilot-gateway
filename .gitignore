@@ -3,9 +3,13 @@ node_modules/
 dist/
 *.log
 .dev.vars
+.env
+!.env.example
 wrangler.toml
 oai-compatible-copilot/
 configs/*.jsonc
 !configs/*.example.jsonc
 configs/*.json
 !configs/*.example.json
+configs/*.env
+test_deepseek.py

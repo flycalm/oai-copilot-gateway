@@ -7,10 +7,13 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy --keep-vars",
+    "build:node": "node scripts/build.mjs",
+    "start:node": "node dist/server.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20251228.0",
+    "esbuild": "^0.25.0",
     "typescript": "^5.0.0",
     "wrangler": "^4.56.0"
   }

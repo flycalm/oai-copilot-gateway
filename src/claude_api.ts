@@ -1,5 +1,6 @@
 import type { Env } from "./common";
 import {
+  applyUpstreamCustomHeaders,
   jsonError,
   jsonResponse,
   joinPathPrefix,
@@ -654,12 +655,15 @@ export async function handleClaudeCountTokens({ request, env, reqJson, debug, re
     if (k.startsWith("__")) delete body[k];
   }
 
-  const headers: Record<string, string> = {
-    "content-type": "application/json",
-    authorization: `Bearer ${key}`,
-    "x-api-key": key,
-    "anthropic-version": "2023-06-01",
-  };
+  const headers: Record<string, string> = applyUpstreamCustomHeaders(
+    {
+      "content-type": "application/json",
+      authorization: `Bearer ${key}`,
+      "x-api-key": key,
+      "anthropic-version": "2023-06-01",
+    },
+    env,
+  );
 
   // Best-effort: if upstream fails, return a local estimate rather than 5xx.
   for (const url of urls) {
@@ -687,4 +691,3 @@ export async function handleClaudeCountTokens({ request, env, reqJson, debug, re
   void request;
   return jsonResponse(200, out);
 }
-

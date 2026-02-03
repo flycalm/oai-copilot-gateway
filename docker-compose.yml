@@ -1,0 +1,29 @@
+services:
+  rsp4copilot:
+    build: .
+    restart: unless-stopped
+    ports:
+      # Public port on your server -> container port.
+      # Set `PUBLIC_PORT=30018` in `.env` to expose on 30018.
+      - "${PUBLIC_PORT:-8788}:8788"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8788"
+      RSP4COPILOT_CONFIG_FILE: "/config/rsp4copilot.config.jsonc"
+      # Optional: an overlay env file (for web-managed upstream keys).
+      # Values in this file override docker-compose env vars.
+      RSP4COPILOT_ENV_FILE: "/config/rsp4copilot.env"
+      WEB_UI_CONFIG_WRITE: "true"
+      WEB_UI_SECRETS_VIEW: "true"
+      WEB_UI_SECRETS_WRITE: "true"
+      # For Copilot clients (oai-compatible-copilot/*): whether to use upstream streaming.
+      # Default behavior (when unset) is "false" to avoid some upstreams hanging with an empty SSE.
+      # Set to "true" only if your upstream reliably streams `data:` lines promptly.
+      # RSP4COPILOT_COPILOT_UPSTREAM_STREAM: "true"
+      RSP4COPILOT_DEBUG: "true"
+    env_file:
+      - .env
+    volumes:
+      # Mount configs directory so the web UI can optionally read/write the config file.
+      # If you don't want web-based edits, you can mount the file read-only instead.
+      - ./configs:/config
