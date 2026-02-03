@@ -35,7 +35,7 @@ import { parseGatewayConfig } from "./config";
 import { dispatchOpenAIChatToProvider } from "./dispatch";
 import { resolveModel } from "./model_resolver";
 import { geminiModelsList, ollamaModelsList, openaiModelsListFromEntries, type ModelListEntry } from "./models_list";
-import { refreshDiscoveredModelsForConfig } from "./models_discovery";
+import { fetchUpstreamModelsForProvider } from "./models_discovery";
 import { handleGeminiGenerateContentUpstream } from "./providers/gemini";
 import { handleOpenAIRequest, handleOpenAIResponsesUpstream } from "./providers/openai";
 import { geminiRequestToOpenAIChat, openAIChatResponseToGemini } from "./protocols/gemini";
@@ -1379,6 +1379,110 @@ function webUiHtml(): string {
 			      });
 			    }
 
+			    function promptSelectModal({ title, label, placeholder, options, okText, cancelText }){
+			      return new Promise((resolve) => {
+			        const list0 = Array.isArray(options) ? options.map((x) => safeStr(x).trim()).filter(Boolean) : [];
+			        const list = Array.from(new Set(list0)).sort();
+
+			        const overlay = document.createElement('div');
+			        overlay.style.position = 'fixed';
+			        overlay.style.inset = '0';
+			        overlay.style.background = 'rgba(0,0,0,.55)';
+			        overlay.style.display = 'flex';
+			        overlay.style.alignItems = 'center';
+			        overlay.style.justifyContent = 'center';
+			        overlay.style.padding = '16px';
+			        overlay.style.zIndex = '9999';
+
+			        const card = document.createElement('div');
+			        card.className = 'card';
+			        card.style.maxWidth = '720px';
+			        card.style.width = '100%';
+			        card.style.margin = '0';
+
+			        const h = document.createElement('div');
+			        h.style.fontWeight = '800';
+			        h.style.fontSize = '16px';
+			        h.style.marginBottom = '12px';
+			        h.textContent = safeStr(title || '请选择');
+
+			        const lab = document.createElement('label');
+			        lab.textContent = safeStr(label || '');
+
+			        const filter = document.createElement('input');
+			        filter.placeholder = safeStr(placeholder || '输入以过滤...');
+			        filter.autocomplete = 'off';
+
+			        const select = document.createElement('select');
+			        select.size = 12;
+			        select.style.width = '100%';
+			        select.style.fontFamily = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+			        select.style.fontSize = '13px';
+
+			        function renderList(){
+			          const needle = safeStr(filter.value || '').trim().toLowerCase();
+			          try { select.innerHTML = ''; } catch {}
+			          const filtered = needle ? list.filter((x) => x.toLowerCase().includes(needle)) : list;
+			          for (const item of filtered) {
+			            const opt = document.createElement('option');
+			            opt.value = item;
+			            opt.textContent = item;
+			            select.appendChild(opt);
+			          }
+			          if (select.options.length) select.selectedIndex = 0;
+			        }
+			        renderList();
+			        filter.addEventListener('input', renderList);
+
+			        const actions = document.createElement('div');
+			        actions.style.display = 'flex';
+			        actions.style.gap = '10px';
+			        actions.style.justifyContent = 'flex-end';
+			        actions.style.marginTop = '14px';
+
+			        const cancel = document.createElement('button');
+			        cancel.textContent = safeStr(cancelText || '取消');
+
+			        const ok = document.createElement('button');
+			        ok.className = 'primary';
+			        ok.textContent = safeStr(okText || '确定');
+
+			        function close(val){
+			          try { overlay.remove(); } catch {}
+			          resolve(val);
+			        }
+
+			        cancel.addEventListener('click', (e) => { e.preventDefault(); close(null); });
+			        ok.addEventListener('click', (e) => { e.preventDefault(); close(safeStr(select.value || '').trim()); });
+			        select.addEventListener('dblclick', (e) => { e.preventDefault(); close(safeStr(select.value || '').trim()); });
+			        overlay.addEventListener('click', (e) => { if (e.target === overlay) close(null); });
+			        const onKeyDown = (e) => {
+			          if (e.key === 'Escape') close(null);
+			          if (e.key === 'Enter') close(safeStr(select.value || '').trim());
+			        };
+			        window.addEventListener('keydown', onKeyDown);
+
+			        const close0 = close;
+			        close = (val) => {
+			          try { window.removeEventListener('keydown', onKeyDown); } catch {}
+			          close0(val);
+			        };
+
+			        actions.appendChild(cancel);
+			        actions.appendChild(ok);
+
+			        card.appendChild(h);
+			        if (label) card.appendChild(lab);
+			        card.appendChild(filter);
+			        card.appendChild(select);
+			        card.appendChild(actions);
+
+			        overlay.appendChild(card);
+			        document.body.appendChild(overlay);
+			        setTimeout(() => { try { filter.focus(); } catch {} }, 0);
+			      });
+			    }
+
 			    function createApiKeyEnvEditor({ getValue, setValue, choices, placeholder }){
 			      const wrap = document.createElement('div');
 			      wrap.style.display = 'grid';
@@ -1929,15 +2033,68 @@ function webUiHtml(): string {
 	        addModelBtn.textContent = '➕ 添加 model';
 	        addModelBtn.style.marginBottom = '12px';
 	        addModelBtn.addEventListener('click', (e) => {
-	          e.preventDefault();
-	          const name = prompt('modelName（对外展示/请求里使用）', '');
-	          if (!name) return;
-	          const n = name.trim();
-	          if (!n) return;
-	          p.models = (p.models && typeof p.models === 'object') ? p.models : {};
-	          if (!p.models[n]) p.models[n] = { upstreamModel: n };
-	          providers[pid] = p;
-	          renderProvidersForm();
+	          (async () => {
+	            e.preventDefault();
+
+	            const useDiscover = Boolean(p.discoverModels);
+	            if (useDiscover) {
+	              try {
+	                const r = await callGateway('/v1/upstream_models?provider=' + encodeURIComponent(pid), { method: 'GET' });
+	                if (r.status === 200) {
+	                  let list = [];
+	                  try {
+	                    const json = JSON.parse(r.text || '{}');
+	                    const data = Array.isArray(json && json.data) ? json.data : [];
+	                    list = data.map((x) => safeStr(x && x.id ? x.id : x).trim()).filter(Boolean);
+	                  } catch {}
+
+	                  if (Array.isArray(list) && list.length) {
+	                    const chosen = await promptSelectModal({
+	                      title: '选择上游模型',
+	                      label: '从上游 /v1/models 获取到的候选模型（可搜索过滤）',
+	                      placeholder: '例如 gpt-5.2 / gpt-5.2-codex ...',
+	                      options: list,
+	                      okText: '使用该模型',
+	                      cancelText: '取消',
+	                    });
+	                    if (!chosen) return;
+
+	                    const alias0 = await promptTextModal({
+	                      title: '添加 model',
+	                      label: '对外 modelName（客户端请求里使用）',
+	                      placeholder: '例如 gpt-5.2',
+	                      initialValue: chosen,
+	                      okText: '添加',
+	                      cancelText: '取消',
+	                    });
+	                    if (!alias0) return;
+	                    const alias = alias0.trim();
+	                    if (!alias) return;
+
+	                    p.models = (p.models && typeof p.models === 'object') ? p.models : {};
+	                    p.models[alias] = { upstreamModel: chosen };
+	                    providers[pid] = p;
+	                    renderProvidersForm();
+	                    return;
+	                  }
+	                } else {
+	                  // Fallback to manual input when upstream fetch fails or discoverModels is disabled server-side.
+	                  try { alert('拉取上游模型失败：HTTP ' + r.status + '\\n\\n' + (r.text || '')); } catch {}
+	                }
+	              } catch (err) {
+	                try { alert('拉取上游模型异常：' + String(err && err.message ? err.message : err)); } catch {}
+	              }
+	            }
+
+	            const name = prompt('modelName（对外展示/请求里使用）', '');
+	            if (!name) return;
+	            const n = name.trim();
+	            if (!n) return;
+	            p.models = (p.models && typeof p.models === 'object') ? p.models : {};
+	            if (!p.models[n]) p.models[n] = { upstreamModel: n };
+	            providers[pid] = p;
+	            renderProvidersForm();
+	          })();
 	        });
 	        modelsWrap.appendChild(addModelBtn);
 
@@ -2751,20 +2908,29 @@ export default {
           }
         }
 
-        // Optional: discover models from upstream `/v1/models` (OpenAI-compatible relays), then cache with TTL.
-        try {
-          const discovered = await refreshDiscoveredModelsForConfig({ env, config: gatewayCfg.config, request, reqId, debug });
-          for (const m of discovered) {
-            const key = `${m.providerId}::${m.modelName}`;
-            if (seen.has(key)) continue;
-            seen.add(key);
-            entries.push(m);
-          }
-        } catch (e) {
-          logDebug(debug, reqId, "models discovery: failed", { error: String((e as any)?.message || e) });
+        return withCors(jsonResponse(200, openaiModelsListFromEntries(entries)), corsHeaders);
+      }
+      if (request.method === "GET" && path === "/v1/upstream_models") {
+        if (!gatewayCfg.ok || !gatewayCfg.config) {
+          return withCors(jsonResponse(500, jsonError(gatewayCfg.error || "Server misconfigured: missing RSP4COPILOT_CONFIG", "server_error")), corsHeaders);
+        }
+        const providerId = (url.searchParams.get("provider") || url.searchParams.get("providerId") || "").trim();
+        if (!providerId) return withCors(jsonResponse(400, jsonError("Missing required query: provider", "invalid_request_error")), corsHeaders);
+        const provider = gatewayCfg.config.providers?.[providerId];
+        if (!provider) return withCors(jsonResponse(404, jsonError(`Unknown provider: ${providerId}`, "not_found")), corsHeaders);
+        if (!(provider as any)?.discoverModels) {
+          return withCors(jsonResponse(400, jsonError(`Provider ${providerId}: discoverModels is disabled`, "invalid_request_error")), corsHeaders);
         }
 
-        return withCors(jsonResponse(200, openaiModelsListFromEntries(entries)), corsHeaders);
+        const ownedBy = typeof provider?.ownedBy === "string" && provider.ownedBy.trim() ? provider.ownedBy.trim() : providerId;
+        const ids = await fetchUpstreamModelsForProvider({ env, provider, request, reqId, debug });
+        return withCors(
+          jsonResponse(200, {
+            object: "list",
+            data: ids.map((id) => ({ id, object: "model", created: 0, owned_by: ownedBy })),
+          }),
+          corsHeaders,
+        );
       }
       if (request.method === "GET" && path === "/gemini/v1beta/models") {
         if (!gatewayCfg.ok || !gatewayCfg.config) {

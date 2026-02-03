@@ -1,11 +1,6 @@
 import { jsonError } from "./common";
 import type { GatewayConfig, ModelConfig, ProviderConfig } from "./config";
 
-function buildDynamicModelConfig(modelName: string): ModelConfig {
-  const name = String(modelName || "").trim();
-  return { name, upstreamModel: name, options: {}, quirks: {} };
-}
-
 export function splitProviderModel(
   modelId: unknown,
 ): { ok: true; providerId: string; modelName: string; error: "" } | { ok: false; providerId: ""; modelName: ""; error: string } {
@@ -79,9 +74,6 @@ export function resolveModel(
       if (sel.ok) {
         const model = sel.provider.models[maybeModelName];
         if (model) return { ok: true, providerId: sel.providerId, modelName: maybeModelName, provider: sel.provider, model };
-        if ((sel.provider as any)?.discoverModels) {
-          return { ok: true, providerId: sel.providerId, modelName: maybeModelName, provider: sel.provider, model: buildDynamicModelConfig(maybeModelName) };
-        }
         return { ok: false, status: 400, error: jsonError(`Unknown model for provider ${sel.providerId}: ${maybeModelName}`, "invalid_request_error") };
       }
     }
@@ -96,9 +88,6 @@ export function resolveModel(
     if (!sel.ok) return { ok: false, status: 400, error: jsonError(sel.error, "invalid_request_error") };
     const model = sel.provider.models[modelName];
     if (model) return { ok: true, providerId: sel.providerId, modelName, provider: sel.provider, model };
-    if ((sel.provider as any)?.discoverModels) {
-      return { ok: true, providerId: sel.providerId, modelName, provider: sel.provider, model: buildDynamicModelConfig(modelName) };
-    }
     return { ok: false, status: 400, error: jsonError(`Unknown model for provider ${sel.providerId}: ${modelName}`, "invalid_request_error") };
   }
 
@@ -110,15 +99,6 @@ export function resolveModel(
   }
 
   if (!matches.length) {
-    const dynamicProviders = Object.entries(config.providers)
-      .filter(([, p]) => Boolean((p as any)?.discoverModels))
-      .map(([pid]) => pid);
-    if (dynamicProviders.length === 1) {
-      const providerId = dynamicProviders[0];
-      const provider = config.providers[providerId];
-      return { ok: true, providerId, modelName, provider, model: buildDynamicModelConfig(modelName) };
-    }
-
     return { ok: false, status: 400, error: jsonError(`Unknown model: ${modelName}`, "invalid_request_error") };
   }
   if (matches.length > 1) {

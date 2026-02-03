@@ -104,6 +104,23 @@ function shouldDiscoverModels(provider: ProviderConfig): boolean {
   return Boolean((provider as any)?.discoverModels);
 }
 
+export async function fetchUpstreamModelsForProvider({
+  env,
+  provider,
+  request,
+  reqId,
+  debug,
+}: {
+  env: Env;
+  provider: ProviderConfig;
+  request: Request;
+  reqId: string;
+  debug: boolean;
+}): Promise<string[]> {
+  if (!provider || !shouldDiscoverModels(provider)) return [];
+  return fetchModelsFromUpstream({ env, provider, request, reqId, debug });
+}
+
 async function fetchModelsFromUpstream({
   env,
   provider,
@@ -169,35 +186,4 @@ async function fetchModelsFromUpstream({
   }
 
   return Array.from(all).sort((a, b) => a.localeCompare(b));
-}
-
-export async function refreshDiscoveredModelsForConfig({
-  env,
-  config,
-  request,
-  reqId,
-  debug,
-}: {
-  env: Env;
-  config: GatewayConfig;
-  request: Request;
-  reqId: string;
-  debug: boolean;
-}): Promise<Array<{ providerId: string; modelName: string; ownedBy: string }>> {
-  const providers = Object.values(config.providers || {});
-  const tasks = providers
-    .filter((p) => p && shouldDiscoverModels(p))
-    .map(async (provider) => {
-      const modelNames = await fetchModelsFromUpstream({ env, provider, request, reqId, debug });
-      const ownedBy = typeof provider?.ownedBy === "string" && provider.ownedBy.trim() ? provider.ownedBy.trim() : provider.id;
-      return modelNames.map((modelName) => ({ providerId: provider.id, modelName, ownedBy }));
-    });
-
-  const settled = await Promise.allSettled(tasks);
-  const out: Array<{ providerId: string; modelName: string; ownedBy: string }> = [];
-  for (const r of settled) {
-    if (r.status !== "fulfilled") continue;
-    out.push(...r.value);
-  }
-  return out;
 }

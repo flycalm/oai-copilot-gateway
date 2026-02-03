@@ -69,7 +69,7 @@
       "apiMode": "openai-responses",
       "baseURL": "https://your-relay.example/openai",
       "apiKey": "REPLACE_ME",
-      // 可选：自动从上游拉取 GET /v1/models（用于前端下拉框/免手写模型名）
+      // 可选：让 Web UI 在“添加 model”时能从上游拉取候选模型（GET /v1/models）供选择
       "discoverModels": true,
       "quirks": {
         "noInstructions": false,
