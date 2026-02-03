@@ -38,10 +38,32 @@ export interface ProviderConfig {
   models: Record<string, ModelConfig>;
 }
 
-export interface GatewayConfig {
+export type ModelRouteStrategy = "priority" | "round_robin" | "random" | "hash";
+
+export interface ModelRouteProviderConfig {
+  providerId: string;
+  upstreamModel?: string;
+  weight?: number;
+}
+
+export interface ModelRouteConfig {
+  strategy: ModelRouteStrategy;
+  providers: ModelRouteProviderConfig[];
+}
+
+export interface GatewayConfigV1 {
   version: 1;
   providers: Record<string, ProviderConfig>;
 }
+
+export interface GatewayConfigV2 {
+  version: 2;
+  providers: Record<string, ProviderConfig>;
+  models: Record<string, ModelConfig>;
+  routes: Record<string, ModelRouteConfig>;
+}
+
+export type GatewayConfig = GatewayConfigV1 | GatewayConfigV2;
 
 function normalizeStringArrayOrString(value: unknown): string[] {
   if (Array.isArray(value)) return value.map((v) => String(v ?? "").trim()).filter(Boolean);
@@ -92,6 +114,14 @@ function normalizeBoolLike(raw: unknown): boolean {
   if (!v0) return false;
   const v = v0.toLowerCase();
   return v === "1" || v === "true" || v === "yes" || v === "y" || v === "on";
+}
+
+function normalizeRouteStrategy(raw: unknown): ModelRouteStrategy {
+  const v0 = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (v0 === "roundrobin" || v0 === "round-robin" || v0 === "rr" || v0 === "round_robin") return "round_robin";
+  if (v0 === "random" || v0 === "rand") return "random";
+  if (v0 === "hash" || v0 === "sticky" || v0 === "affinity") return "hash";
+  return "priority";
 }
 
 function inferProviderOwnedBy(apiMode: string, providerId: string): string {
@@ -189,6 +219,23 @@ function normalizeModelConfig(name: string, raw: unknown): ModelConfig {
   return { name, upstreamModel: upstreamModel || name, options, quirks };
 }
 
+function normalizeRouteProviderConfig(raw: unknown): ModelRouteProviderConfig | null {
+  if (typeof raw === "string") {
+    const pid = raw.trim();
+    if (!pid) return null;
+    return { providerId: pid };
+  }
+  const obj = isPlainObject(raw) ? raw : {};
+  const providerId = typeof (obj as any).providerId === "string" ? String((obj as any).providerId).trim() : String((obj as any).id ?? (obj as any).provider ?? "").trim();
+  if (!providerId) return null;
+  const upstreamModel = typeof (obj as any).upstreamModel === "string" ? String((obj as any).upstreamModel).trim() : "";
+  const weight = normalizeWeight((obj as any).weight ?? (obj as any).w);
+  const out: ModelRouteProviderConfig = { providerId };
+  if (upstreamModel) out.upstreamModel = upstreamModel;
+  if (Number.isFinite(weight) && weight !== 1) out.weight = weight;
+  return out;
+}
+
 function readGatewayConfigRaw(env: Env): string {
   const primary = typeof (env as any)?.RSP4COPILOT_CONFIG === "string" ? String((env as any).RSP4COPILOT_CONFIG) : "";
   if (primary.trim()) return primary;
@@ -208,7 +255,7 @@ export function parseGatewayConfig(env: Env):
   if (!isPlainObject(root)) return { ok: false, config: null, source: "env", error: "Config must be a JSON object" };
 
   const version = Number((root as any).version ?? 1);
-  if (!Number.isFinite(version) || version !== 1) return { ok: false, config: null, source: "env", error: "Unsupported config version" };
+  if (!Number.isFinite(version) || (version !== 1 && version !== 2)) return { ok: false, config: null, source: "env", error: "Unsupported config version" };
 
   const providersRaw = isPlainObject((root as any).providers) ? ((root as any).providers as Record<string, unknown>) : null;
   if (!providersRaw) return { ok: false, config: null, source: "env", error: "Missing providers" };
@@ -280,7 +327,48 @@ export function parseGatewayConfig(env: Env):
 
   if (!Object.keys(providers).length) return { ok: false, config: null, source: "env", error: "No providers configured" };
 
-  return { ok: true, config: { version: 1, providers }, source: "env", error: "" };
+  if (version === 1) {
+    return { ok: true, config: { version: 1, providers }, source: "env", error: "" };
+  }
+
+  const modelsRaw = isPlainObject((root as any).models) ? ((root as any).models as Record<string, unknown>) : {};
+  const routesRaw =
+    (isPlainObject((root as any).routes) ? ((root as any).routes as Record<string, unknown>) : null) ||
+    (isPlainObject((root as any).bindings) ? ((root as any).bindings as Record<string, unknown>) : null) ||
+    (isPlainObject((root as any).modelRoutes) ? ((root as any).modelRoutes as Record<string, unknown>) : null) ||
+    {};
+
+  const models: Record<string, ModelConfig> = {};
+  for (const [mnRaw, mr] of Object.entries(modelsRaw)) {
+    const mn = String(mnRaw ?? "").trim();
+    if (!mn) continue;
+    if (mn.includes(":")) return { ok: false, config: null, source: "env", error: `Model name must not contain ':': ${mn}` };
+    models[mn] = normalizeModelConfig(mn, mr);
+  }
+
+  const routes: Record<string, ModelRouteConfig> = {};
+  for (const [modelNameRaw, rr] of Object.entries(routesRaw)) {
+    const modelName = String(modelNameRaw ?? "").trim();
+    if (!modelName) continue;
+    if (modelName.includes(":")) return { ok: false, config: null, source: "env", error: `Route model name must not contain ':': ${modelName}` };
+    if (!models[modelName]) {
+      return { ok: false, config: null, source: "env", error: `Route refers to unknown model: ${modelName}` };
+    }
+    const obj = isPlainObject(rr) ? rr : {};
+    const strategy = normalizeRouteStrategy((obj as any).strategy ?? (obj as any).mode);
+    const listRaw = Array.isArray((obj as any).providers) ? ((obj as any).providers as unknown[]) : [];
+    const providerRefs: ModelRouteProviderConfig[] = [];
+    for (const item of listRaw) {
+      const ref = normalizeRouteProviderConfig(item);
+      if (!ref) continue;
+      if (ref.providerId.includes(".")) return { ok: false, config: null, source: "env", error: `Route provider id must not contain '.': ${ref.providerId}` };
+      if (!providers[ref.providerId]) return { ok: false, config: null, source: "env", error: `Route model ${modelName}: unknown provider ${ref.providerId}` };
+      providerRefs.push(ref);
+    }
+    routes[modelName] = { strategy, providers: providerRefs };
+  }
+
+  return { ok: true, config: { version: 2, providers, models, routes }, source: "env", error: "" };
 }
 
 export function getProviderApiKey(env: Env, provider: ProviderConfig): string {

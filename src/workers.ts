@@ -2259,7 +2259,7 @@ function webUiHtml(): string {
 	      }
 
 	      const version = Number(root.version ?? 1);
-	      if (!(version === 1)) warns.push('version 不是 1（当前仅支持 version=1）。');
+	      if (!(version === 1 || version === 2)) warns.push('version 不是 1/2（可能无法被服务端解析）。');
 
 	      const providers = (root.providers && typeof root.providers === 'object') ? root.providers : null;
 	      if (!providers || !Object.keys(providers).length) {
@@ -2304,13 +2304,40 @@ function webUiHtml(): string {
 		          if (keyEnv) requiredKeyNames.add(keyEnv);
 		        }
 
-		        const models = (p.models && typeof p.models === 'object') ? p.models : {};
-		        const mnames = Object.keys(models || {});
-		        if (!mnames.length) warns.push('Provider ' + pid + ': 未配置 models（建议至少 1 个）。');
+		        if (version === 1) {
+		          const models = (p.models && typeof p.models === 'object') ? p.models : {};
+		          const mnames = Object.keys(models || {});
+		          if (!mnames.length) warns.push('Provider ' + pid + ': 未配置 models（建议至少 1 个）。');
+		          for (const mn of mnames) {
+		            const m = (models[mn] && typeof models[mn] === 'object') ? models[mn] : {};
+		            const up = safeStr(m.upstreamModel || '').trim();
+		            if (!up) warns.push('Provider ' + pid + ' model ' + mn + ': upstreamModel 为空（请求时可能失败）。');
+		          }
+		        }
+		      }
+
+		      if (version === 2) {
+		        const models = (root.models && typeof root.models === 'object') ? root.models : {};
+		        const routes = (root.routes && typeof root.routes === 'object') ? root.routes : {};
+		        const mnames = Object.keys(models || {}).sort();
+		        if (!mnames.length) warns.push('models 为空（需要至少 1 个模型才会对外暴露）。');
 		        for (const mn of mnames) {
 		          const m = (models[mn] && typeof models[mn] === 'object') ? models[mn] : {};
 		          const up = safeStr(m.upstreamModel || '').trim();
-		          if (!up) warns.push('Provider ' + pid + ' model ' + mn + ': upstreamModel 为空（请求时可能失败）。');
+		          if (!up) warns.push('Model ' + mn + ': default upstreamModel 为空（建议填）。');
+		          const r = (routes[mn] && typeof routes[mn] === 'object') ? routes[mn] : null;
+		          const plist = r && Array.isArray(r.providers) ? r.providers : [];
+		          if (!plist.length) warns.push('Model ' + mn + ': 未绑定任何 provider（不会出现在 /v1/models）。');
+		          const seen = new Set();
+		          for (const item of plist) {
+		            const pid = item && typeof item === 'object' ? safeStr(item.providerId || '').trim() : safeStr(item).trim();
+		            if (!pid) { warns.push('Model ' + mn + ': 绑定项 providerId 为空'); continue; }
+		            if (!providers[pid]) errors.push('Model ' + mn + ': 绑定了不存在的 provider: ' + pid);
+		            if (seen.has(pid)) warns.push('Model ' + mn + ': provider 绑定重复: ' + pid);
+		            seen.add(pid);
+		            const upm = item && typeof item === 'object' ? safeStr(item.upstreamModel || '').trim() : '';
+		            if (!upm) warns.push('Model ' + mn + ' -> ' + pid + ': upstreamModel 为空（将回退到 default upstreamModel）。');
+		          }
 		        }
 		      }
 
@@ -2336,6 +2363,7 @@ function webUiHtml(): string {
 		      if (!providersFormEl) return;
 		      const root = normalizeCfgObjForUi(ensureCfgObj());
 		      providersFormEl.innerHTML = '';
+		      const isV2 = Number(root && root.version) === 2;
 		      const providers = root.providers && typeof root.providers === 'object' ? root.providers : {};
 		      const apiKeyEnvDefaults = [
 		        'OPENAI_API_KEY',
@@ -2346,6 +2374,54 @@ function webUiHtml(): string {
 		      ];
 		      const apiKeyEnvChoicesForUi = mergeStringLists(apiKeyEnvDefaults, mergeStringLists(collectApiKeyEnvChoicesFromConfig(root), apiKeyEnvChoiceState.list));
 		      const ids = Object.keys(providers).sort();
+
+		      if (!isV2) {
+		        const notice = document.createElement('div');
+		        notice.className = 'card';
+		        notice.style.marginBottom = '16px';
+		        notice.style.display = 'grid';
+		        notice.style.gap = '10px';
+		        const title = document.createElement('div');
+		        title.style.fontWeight = '800';
+		        title.textContent = '🧩 配置模式：v1（provider 内绑定 models）';
+		        const desc = document.createElement('div');
+		        desc.className = 'muted';
+		        desc.textContent = '如需“模型/供应商解绑（模型可绑定多个 provider，按策略自动路由）”，可升级到 v2。';
+		        const btn = document.createElement('button');
+		        btn.className = 'primary';
+		        btn.textContent = '升级到 v2（模型/供应商解绑）';
+		        btn.addEventListener('click', (e) => {
+		          e.preventDefault();
+		          if (!confirm('确认把配置升级到 v2？（会把 provider.models 转换为 root.models + root.routes，并清空 provider.models）')) return;
+		          root.version = 2;
+		          if (!root.models || typeof root.models !== 'object') root.models = {};
+		          if (!root.routes || typeof root.routes !== 'object') root.routes = {};
+		          for (const pid of Object.keys(root.providers || {})) {
+		            const p = (root.providers[pid] && typeof root.providers[pid] === 'object') ? root.providers[pid] : {};
+		            const pm = (p.models && typeof p.models === 'object') ? p.models : {};
+		            for (const mn of Object.keys(pm)) {
+		              const m0 = pm[mn] || {};
+		              const modelName = safeStr(mn).trim();
+		              if (!modelName) continue;
+		              if (!root.models[modelName]) root.models[modelName] = { upstreamModel: modelName, options: {}, quirks: {} };
+		              if (!root.routes[modelName] || typeof root.routes[modelName] !== 'object') root.routes[modelName] = { strategy: 'priority', providers: [] };
+		              const route = root.routes[modelName];
+		              if (!Array.isArray(route.providers)) route.providers = [];
+		              if (route.providers.some((x) => x && typeof x === 'object' && safeStr(x.providerId).trim() === pid)) continue;
+		              route.providers.push({ providerId: pid, upstreamModel: safeStr(m0.upstreamModel || modelName).trim() || modelName });
+		            }
+		            p.models = {};
+		            root.providers[pid] = p;
+		          }
+		          cfgObj = root;
+		          renderProvidersForm();
+		        });
+		        notice.appendChild(title);
+		        notice.appendChild(desc);
+		        notice.appendChild(btn);
+		        providersFormEl.appendChild(notice);
+		      }
+
 		      if (!ids.length) {
 		        const empty = document.createElement('div');
 	        empty.className = 'card muted';
@@ -2353,7 +2429,7 @@ function webUiHtml(): string {
 	        empty.style.padding = '32px';
 	        empty.innerHTML = '<div style="font-size:48px; margin-bottom:12px">📦</div><div>尚未配置任何 provider</div><div style="margin-top:8px">点击上方"添加 Provider"开始配置</div>';
 	        providersFormEl.appendChild(empty);
-	        return;
+	        if (!isV2) return;
 	      }
 
 	      for (const pid of ids) {
@@ -2575,99 +2651,243 @@ function webUiHtml(): string {
 		          grid.appendChild(keyWrap);
 		        }
 
-	        const modelsWrap = document.createElement('div');
-	        const modelsLabel = document.createElement('label');
-	        modelsLabel.textContent = '🤖 models（模型列表）';
-	        modelsWrap.appendChild(modelsLabel);
+	        if (!isV2) {
+	          const modelsWrap = document.createElement('div');
+	          const modelsLabel = document.createElement('label');
+	          modelsLabel.textContent = '🤖 models（模型列表）';
+	          modelsWrap.appendChild(modelsLabel);
 
-	        const addModelBtn = document.createElement('button');
-	        addModelBtn.textContent = '➕ 添加 model';
-	        addModelBtn.style.marginBottom = '12px';
-	        addModelBtn.addEventListener('click', (e) => {
-	          (async () => {
-	            e.preventDefault();
+	          const addModelBtn = document.createElement('button');
+	          addModelBtn.textContent = '➕ 添加 model';
+	          addModelBtn.style.marginBottom = '12px';
+	          addModelBtn.addEventListener('click', (e) => {
+	            (async () => {
+	              e.preventDefault();
 
-	            const useDiscover = Boolean(p.discoverModels);
-	            if (useDiscover) {
-	              try {
-	                const r = await callGateway('/v1/upstream_models?provider=' + encodeURIComponent(pid), { method: 'GET' });
-	                if (r.status === 200) {
-	                  let list = [];
-	                  try {
-	                    const json = JSON.parse(r.text || '{}');
-	                    const data = Array.isArray(json && json.data) ? json.data : [];
-	                    list = data.map((x) => safeStr(x && x.id ? x.id : x).trim()).filter(Boolean);
-	                  } catch {}
+	              const useDiscover = Boolean(p.discoverModels);
+	              if (useDiscover) {
+	                try {
+	                  const r = await callGateway('/v1/upstream_models?provider=' + encodeURIComponent(pid), { method: 'GET' });
+	                  if (r.status === 200) {
+	                    let list = [];
+	                    try {
+	                      const json = JSON.parse(r.text || '{}');
+	                      const data = Array.isArray(json && json.data) ? json.data : [];
+	                      list = data.map((x) => safeStr(x && x.id ? x.id : x).trim()).filter(Boolean);
+	                    } catch {}
 
-	                  if (Array.isArray(list) && list.length) {
-	                    const chosen = await promptSelectModal({
-	                      title: '选择上游模型',
-	                      label: '从上游 /v1/models 获取到的候选模型（可搜索过滤）',
-	                      placeholder: '例如 gpt-5.2 / gpt-5.2-codex ...',
-	                      options: list,
-	                      okText: '使用该模型',
-	                      cancelText: '取消',
-	                    });
-	                    if (!chosen) return;
+	                    if (Array.isArray(list) && list.length) {
+	                      const chosen = await promptSelectModal({
+	                        title: '选择上游模型',
+	                        label: '从上游 /v1/models 获取到的候选模型（可搜索过滤）',
+	                        placeholder: '例如 gpt-5.2 / gpt-5.2-codex ...',
+	                        options: list,
+	                        okText: '使用该模型',
+	                        cancelText: '取消',
+	                      });
+	                      if (!chosen) return;
 
-	                    const alias0 = await promptTextModal({
-	                      title: '添加 model',
-	                      label: '对外 modelName（客户端请求里使用）',
-	                      placeholder: '例如 gpt-5.2',
-	                      initialValue: chosen,
-	                      okText: '添加',
-	                      cancelText: '取消',
-	                    });
-	                    if (!alias0) return;
-	                    const alias = alias0.trim();
-	                    if (!alias) return;
+	                      const alias0 = await promptTextModal({
+	                        title: '添加 model',
+	                        label: '对外 modelName（客户端请求里使用）',
+	                        placeholder: '例如 gpt-5.2',
+	                        initialValue: chosen,
+	                        okText: '添加',
+	                        cancelText: '取消',
+	                      });
+	                      if (!alias0) return;
+	                      const alias = alias0.trim();
+	                      if (!alias) return;
 
-	                    p.models = (p.models && typeof p.models === 'object') ? p.models : {};
-	                    p.models[alias] = { upstreamModel: chosen };
-	                    providers[pid] = p;
-	                    renderProvidersForm();
-	                    return;
+	                      p.models = (p.models && typeof p.models === 'object') ? p.models : {};
+	                      p.models[alias] = { upstreamModel: chosen };
+	                      providers[pid] = p;
+	                      renderProvidersForm();
+	                      return;
+	                    }
+	                  } else {
+	                    // Fallback to manual input when upstream fetch fails or discoverModels is disabled server-side.
+	                    try { alert('拉取上游模型失败：HTTP ' + r.status + '\\n\\n' + (r.text || '')); } catch {}
 	                  }
-	                } else {
-	                  // Fallback to manual input when upstream fetch fails or discoverModels is disabled server-side.
-	                  try { alert('拉取上游模型失败：HTTP ' + r.status + '\\n\\n' + (r.text || '')); } catch {}
+	                } catch (err) {
+	                  try { alert('拉取上游模型异常：' + String(err && err.message ? err.message : err)); } catch {}
 	                }
-	              } catch (err) {
-	                try { alert('拉取上游模型异常：' + String(err && err.message ? err.message : err)); } catch {}
 	              }
-	            }
 
-	            const name = prompt('modelName（对外展示/请求里使用）', '');
-	            if (!name) return;
-	            const n = name.trim();
-	            if (!n) return;
-	            p.models = (p.models && typeof p.models === 'object') ? p.models : {};
-	            if (!p.models[n]) p.models[n] = { upstreamModel: n };
-	            providers[pid] = p;
-	            renderProvidersForm();
-	          })();
+	              const name = prompt('modelName（对外展示/请求里使用）', '');
+	              if (!name) return;
+	              const n = name.trim();
+	              if (!n) return;
+	              p.models = (p.models && typeof p.models === 'object') ? p.models : {};
+	              if (!p.models[n]) p.models[n] = { upstreamModel: n };
+	              providers[pid] = p;
+	              renderProvidersForm();
+	            })();
+	          });
+	          modelsWrap.appendChild(addModelBtn);
+
+	          const models = (p.models && typeof p.models === 'object') ? p.models : {};
+	          const mnames = Object.keys(models).sort();
+	          const list = document.createElement('div');
+	          list.style.display = 'grid';
+	          list.style.gap = '12px';
+
+	          if (!mnames.length) {
+	            const hint = document.createElement('div');
+	            hint.className = 'muted';
+	            hint.style.textAlign = 'center';
+	            hint.style.padding = '20px';
+	            hint.style.border = '1px dashed var(--border)';
+	            hint.style.borderRadius = '8px';
+	            hint.textContent = '💡 建议至少配置 1 个 model';
+	            list.appendChild(hint);
+	          }
+
+	          for (const mn of mnames) {
+	            const m = models[mn] || {};
+	            const row = document.createElement('div');
+	            row.style.border = '1px solid var(--border)';
+	            row.style.borderRadius = '10px';
+	            row.style.padding = '12px';
+	            row.style.display = 'grid';
+	            row.style.gap = '10px';
+	            row.style.background = 'var(--bg)';
+
+	            const top = document.createElement('div');
+	            top.style.display = 'flex';
+	            top.style.justifyContent = 'space-between';
+	            top.style.alignItems = 'center';
+	            top.style.paddingBottom = '8px';
+	            top.style.borderBottom = '1px solid var(--border)';
+
+	            const name = document.createElement('div');
+	            name.style.fontFamily = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+	            name.style.fontSize = '13px';
+	            name.style.fontWeight = '600';
+	            name.style.color = 'var(--accent-light)';
+	            name.textContent = '📦 ' + mn;
+	            top.appendChild(name);
+
+	            const rm = document.createElement('button');
+	            rm.className = 'danger';
+	            rm.textContent = '🗑️ 删除';
+	            rm.style.padding = '6px 12px';
+	            rm.style.fontSize = '13px';
+	            rm.addEventListener('click', (e) => {
+	              e.preventDefault();
+	              delete models[mn];
+	              p.models = models;
+	              providers[pid] = p;
+	              renderProvidersForm();
+	            });
+	            top.appendChild(rm);
+	            row.appendChild(top);
+
+	            const up = document.createElement('input');
+	            up.placeholder = 'upstreamModel（上游真实模型名）';
+	            up.value = safeStr(m.upstreamModel || mn);
+	            up.addEventListener('input', () => { m.upstreamModel = up.value.trim() || mn; models[mn] = m; p.models = models; providers[pid] = p; });
+	            row.appendChild(up);
+
+	            list.appendChild(row);
+	          }
+
+	          modelsWrap.appendChild(list);
+	          grid.appendChild(modelsWrap);
+	        }
+
+	        card.appendChild(grid);
+	        providersFormEl.appendChild(card);
+	      }
+
+	      if (isV2) {
+	        const modelsCard = document.createElement('div');
+	        modelsCard.className = 'card';
+	        modelsCard.style.marginBottom = '16px';
+
+	        const header = document.createElement('div');
+	        header.style.display = 'flex';
+	        header.style.justifyContent = 'space-between';
+	        header.style.alignItems = 'center';
+	        header.style.marginBottom = '16px';
+	        header.style.paddingBottom = '12px';
+	        header.style.borderBottom = '1px solid var(--border)';
+
+	        const title = document.createElement('div');
+	        title.style.display = 'flex';
+	        title.style.alignItems = 'center';
+	        title.style.gap = '10px';
+	        title.innerHTML = '<span style="font-size:20px">🧩</span><span style="font-weight:700; font-size:16px">models（模型） & routes（绑定/路由）</span>';
+	        header.appendChild(title);
+
+	        const addBtn = document.createElement('button');
+	        addBtn.className = 'primary';
+	        addBtn.textContent = '➕ 添加模型';
+	        addBtn.addEventListener('click', async (e) => {
+	          e.preventDefault();
+	          const name0 = await promptTextModal({
+	            title: '添加模型',
+	            label: 'modelName（对外展示/请求里使用）',
+	            placeholder: '例如 gpt-5.2',
+	            initialValue: '',
+	            okText: '添加',
+	            cancelText: '取消',
+	          });
+	          const modelName = safeStr(name0).trim();
+	          if (!modelName) return;
+	          if (modelName.includes(':')) { alert('modelName 不能包含 :'); return; }
+	          if (!root.models || typeof root.models !== 'object') root.models = {};
+	          if (!root.routes || typeof root.routes !== 'object') root.routes = {};
+	          if (root.models[modelName]) { alert('已存在 model: ' + modelName); return; }
+	          root.models[modelName] = { upstreamModel: modelName, options: {}, quirks: {} };
+	          root.routes[modelName] = { strategy: 'priority', providers: [] };
+	          cfgObj = root;
+	          renderProvidersForm();
 	        });
-	        modelsWrap.appendChild(addModelBtn);
+	        header.appendChild(addBtn);
 
-	        const models = (p.models && typeof p.models === 'object') ? p.models : {};
-	        const mnames = Object.keys(models).sort();
+	        modelsCard.appendChild(header);
+
+	        if (!root.models || typeof root.models !== 'object') root.models = {};
+	        if (!root.routes || typeof root.routes !== 'object') root.routes = {};
+
+	        const modelNames = Object.keys(root.models).sort();
 	        const list = document.createElement('div');
 	        list.style.display = 'grid';
 	        list.style.gap = '12px';
 
-	        if (!mnames.length) {
+	        if (!modelNames.length) {
 	          const hint = document.createElement('div');
 	          hint.className = 'muted';
 	          hint.style.textAlign = 'center';
 	          hint.style.padding = '20px';
 	          hint.style.border = '1px dashed var(--border)';
 	          hint.style.borderRadius = '8px';
-	          hint.textContent = '💡 建议至少配置 1 个 model';
+	          hint.textContent = '💡 先添加模型，再绑定 provider；绑定后才会出现在对外 /v1/models 中。';
 	          list.appendChild(hint);
 	        }
 
-	        for (const mn of mnames) {
-	          const m = models[mn] || {};
+	        const providerIds = Object.keys(root.providers || {}).sort();
+
+	        const strategyLabel = (s) => {
+	          const v = safeStr(s).trim();
+	          if (v === 'round_robin') return 'round_robin（轮询）';
+	          if (v === 'random') return 'random（随机/按权重）';
+	          if (v === 'hash') return 'hash（粘性/按权重）';
+	          return 'priority（优先级）';
+	        };
+
+	        for (const mn of modelNames) {
+	          const m = root.models[mn] || {};
+	          const route = (root.routes[mn] && typeof root.routes[mn] === 'object') ? root.routes[mn] : { strategy: 'priority', providers: [] };
+	          if (!Array.isArray(route.providers)) route.providers = [];
+	          if (!route.strategy) route.strategy = 'priority';
+
+	          const usedProviders = route.providers
+	            .map((x) => (x && typeof x === 'object' ? safeStr(x.providerId).trim() : ''))
+	            .filter(Boolean);
+	          const providersText = usedProviders.length ? (' (' + usedProviders.join(', ') + ')') : '（未绑定 provider）';
+
 	          const row = document.createElement('div');
 	          row.style.border = '1px solid var(--border)';
 	          row.style.borderRadius = '10px';
@@ -2688,38 +2908,202 @@ function webUiHtml(): string {
 	          name.style.fontSize = '13px';
 	          name.style.fontWeight = '600';
 	          name.style.color = 'var(--accent-light)';
-	          name.textContent = '📦 ' + mn;
+	          name.textContent = '📦 ' + mn + providersText;
 	          top.appendChild(name);
+
+	          const actions = document.createElement('div');
+	          actions.style.display = 'flex';
+	          actions.style.gap = '10px';
+
+	          const addBind = document.createElement('button');
+	          addBind.textContent = '➕ 绑定 provider';
+	          addBind.addEventListener('click', async (e) => {
+	            e.preventDefault();
+	            const candidates = providerIds.filter((pid) => !usedProviders.includes(pid));
+	            if (!candidates.length) { alert('没有可绑定的 provider（可能需要先添加 provider，或已全部绑定）'); return; }
+	            const chosen = await promptSelectModal({
+	              title: '绑定 provider',
+	              label: '选择要绑定的 provider',
+	              placeholder: '输入以过滤...',
+	              options: candidates,
+	              okText: '绑定',
+	              cancelText: '取消',
+	            });
+	            const pid = safeStr(chosen).trim();
+	            if (!pid) return;
+	            route.providers.push({ providerId: pid, upstreamModel: safeStr(m.upstreamModel || mn).trim() || mn });
+	            root.routes[mn] = route;
+	            cfgObj = root;
+	            renderProvidersForm();
+	          });
+	          actions.appendChild(addBind);
 
 	          const rm = document.createElement('button');
 	          rm.className = 'danger';
-	          rm.textContent = '🗑️ 删除';
-	          rm.style.padding = '6px 12px';
-	          rm.style.fontSize = '13px';
+	          rm.textContent = '🗑️ 删除模型';
 	          rm.addEventListener('click', (e) => {
 	            e.preventDefault();
-	            delete models[mn];
-	            p.models = models;
-	            providers[pid] = p;
+	            if (!confirm('确认删除模型 ' + mn + ' ?')) return;
+	            try { delete root.models[mn]; } catch {}
+	            try { delete root.routes[mn]; } catch {}
+	            cfgObj = root;
 	            renderProvidersForm();
 	          });
-	          top.appendChild(rm);
+	          actions.appendChild(rm);
+
+	          top.appendChild(actions);
 	          row.appendChild(top);
 
 	          const up = document.createElement('input');
-	          up.placeholder = 'upstreamModel（上游真实模型名）';
+	          up.placeholder = 'default upstreamModel（默认上游模型名）';
 	          up.value = safeStr(m.upstreamModel || mn);
-	          up.addEventListener('input', () => { m.upstreamModel = up.value.trim() || mn; models[mn] = m; p.models = models; providers[pid] = p; });
+	          up.addEventListener('input', () => { m.upstreamModel = up.value.trim() || mn; root.models[mn] = m; cfgObj = root; });
 	          row.appendChild(up);
 
+	          const stratWrap = document.createElement('div');
+	          stratWrap.style.display = 'grid';
+	          stratWrap.style.gap = '6px';
+	          const stratLabel = document.createElement('label');
+	          stratLabel.textContent = '路由策略';
+	          const stratSel = document.createElement('select');
+	          const stratOpts = ['priority', 'round_robin', 'random', 'hash'];
+	          for (const s of stratOpts) {
+	            const opt = document.createElement('option');
+	            opt.value = s;
+	            opt.textContent = strategyLabel(s);
+	            stratSel.appendChild(opt);
+	          }
+	          stratSel.value = safeStr(route.strategy || 'priority').trim() || 'priority';
+	          stratSel.addEventListener('change', () => { route.strategy = safeStr(stratSel.value).trim() || 'priority'; root.routes[mn] = route; cfgObj = root; });
+	          stratWrap.appendChild(stratLabel);
+	          stratWrap.appendChild(stratSel);
+	          row.appendChild(stratWrap);
+
+	          const bindsBox = document.createElement('div');
+	          bindsBox.style.display = 'grid';
+	          bindsBox.style.gap = '10px';
+
+	          for (let i = 0; i < route.providers.length; i++) {
+	            const b = route.providers[i] || {};
+	            const bindRow = document.createElement('div');
+	            bindRow.style.border = '1px solid var(--border)';
+	            bindRow.style.borderRadius = '10px';
+	            bindRow.style.padding = '10px';
+	            bindRow.style.display = 'grid';
+	            bindRow.style.gap = '8px';
+
+	            const line1 = document.createElement('div');
+	            line1.style.display = 'flex';
+	            line1.style.gap = '10px';
+	            line1.style.flexWrap = 'wrap';
+	            line1.style.alignItems = 'center';
+
+	            const pidSel = document.createElement('select');
+	            for (const pid0 of providerIds) {
+	              const opt = document.createElement('option');
+	              opt.value = pid0;
+	              opt.textContent = pid0;
+	              pidSel.appendChild(opt);
+	            }
+	            pidSel.value = safeStr(b.providerId || '').trim();
+	            pidSel.addEventListener('change', () => {
+	              const next = safeStr(pidSel.value).trim();
+	              if (!next) return;
+	              const dup = route.providers.some((x, j) => j !== i && x && typeof x === 'object' && safeStr(x.providerId).trim() === next);
+	              if (dup) { alert('该 provider 已绑定'); pidSel.value = safeStr(b.providerId || '').trim(); return; }
+	              b.providerId = next;
+	              route.providers[i] = b;
+	              root.routes[mn] = route;
+	              cfgObj = root;
+	              renderProvidersForm();
+	            });
+	            line1.appendChild(pidSel);
+
+	            const wt = document.createElement('input');
+	            wt.placeholder = 'weight（权重，可选）';
+	            wt.value = safeStr(b.weight == null ? '' : b.weight);
+	            wt.addEventListener('input', () => {
+	              const n = Number(wt.value);
+	              if (Number.isFinite(n) && n > 0) b.weight = Math.floor(n * 1000) / 1000;
+	              else delete b.weight;
+	              route.providers[i] = b;
+	              root.routes[mn] = route;
+	              cfgObj = root;
+	            });
+	            line1.appendChild(wt);
+
+	            const rmBind = document.createElement('button');
+	            rmBind.className = 'danger';
+	            rmBind.textContent = '🗑️ 解绑';
+	            rmBind.addEventListener('click', (e) => {
+	              e.preventDefault();
+	              route.providers.splice(i, 1);
+	              root.routes[mn] = route;
+	              cfgObj = root;
+	              renderProvidersForm();
+	            });
+	            line1.appendChild(rmBind);
+
+	            bindRow.appendChild(line1);
+
+	            const upmWrap = document.createElement('div');
+	            upmWrap.style.display = 'flex';
+	            upmWrap.style.gap = '10px';
+	            upmWrap.style.alignItems = 'center';
+
+	            const upm = document.createElement('input');
+	            upm.placeholder = 'upstreamModel（该 provider 下的上游真实模型名）';
+	            upm.value = safeStr(b.upstreamModel || m.upstreamModel || mn);
+	            upm.addEventListener('input', () => { b.upstreamModel = upm.value.trim() || safeStr(m.upstreamModel || mn).trim() || mn; route.providers[i] = b; root.routes[mn] = route; cfgObj = root; });
+	            upmWrap.appendChild(upm);
+
+	            const pickBtn = document.createElement('button');
+	            pickBtn.textContent = '从上游选择';
+	            pickBtn.addEventListener('click', async (e) => {
+	              e.preventDefault();
+	              const pid1 = safeStr(b.providerId || '').trim();
+	              if (!pid1) return;
+	              const pp = (root.providers && root.providers[pid1] && typeof root.providers[pid1] === 'object') ? root.providers[pid1] : {};
+	              if (!pp.discoverModels) { alert('该 provider 未开启 discoverModels'); return; }
+	              const r = await callGateway('/v1/upstream_models?provider=' + encodeURIComponent(pid1), { method: 'GET' });
+	              if (r.status !== 200) { alert('拉取上游模型失败：HTTP ' + r.status); return; }
+	              let list = [];
+	              try {
+	                const json = JSON.parse(r.text || '{}');
+	                const data = Array.isArray(json && json.data) ? json.data : [];
+	                list = data.map((x) => safeStr(x && x.id ? x.id : x).trim()).filter(Boolean);
+	              } catch {}
+	              if (!list.length) { alert('上游未返回模型列表'); return; }
+	              const chosen = await promptSelectModal({
+	                title: '选择上游模型',
+	                label: '从上游 /v1/models 获取到的候选模型（可搜索过滤）',
+	                placeholder: '输入以过滤...',
+	                options: list,
+	                okText: '使用该模型',
+	                cancelText: '取消',
+	              });
+	              const picked = safeStr(chosen).trim();
+	              if (!picked) return;
+	              upm.value = picked;
+	              b.upstreamModel = picked;
+	              route.providers[i] = b;
+	              root.routes[mn] = route;
+	              cfgObj = root;
+	            });
+	            upmWrap.appendChild(pickBtn);
+
+	            bindRow.appendChild(upmWrap);
+	            bindsBox.appendChild(bindRow);
+	          }
+
+	          row.appendChild(bindsBox);
+	          root.routes[mn] = route;
+	          root.models[mn] = m;
 	          list.appendChild(row);
 	        }
 
-	        modelsWrap.appendChild(list);
-	        grid.appendChild(modelsWrap);
-
-	        card.appendChild(grid);
-	        providersFormEl.appendChild(card);
+	        modelsCard.appendChild(list);
+	        providersFormEl.appendChild(modelsCard);
 	      }
 	    }
 
@@ -3543,7 +3927,7 @@ export default {
 
         if (gatewayCfg.ok && gatewayCfg.config) {
           const providerHint = reqJson.provider ?? reqJson.owned_by ?? reqJson.ownedBy ?? reqJson.owner ?? reqJson.vendor;
-          const resolved = resolveModel(gatewayCfg.config, model, providerHint);
+          const resolved = resolveModel(gatewayCfg.config, model, providerHint, request, reqId);
           if (resolved.ok === false) return withCors(jsonResponse(resolved.status, resolved.error), corsHeaders);
 
           reqJson.model = resolved.model.upstreamModel;
@@ -3583,7 +3967,7 @@ export default {
         if (typeof model !== "string" || !model.trim()) return withCors(jsonResponse(400, jsonError("Missing required field: model")), corsHeaders);
 
         const providerHint = reqJson.provider ?? reqJson.owned_by ?? reqJson.ownedBy ?? reqJson.owner ?? reqJson.vendor;
-        const resolved = resolveModel(gatewayCfg.config, model, providerHint);
+        const resolved = resolveModel(gatewayCfg.config, model, providerHint, request, reqId);
         if (resolved.ok === false) return withCors(jsonResponse(resolved.status, resolved.error), corsHeaders);
 
         const providerApiMode = typeof resolved.provider.apiMode === "string" ? resolved.provider.apiMode.trim() : "";
@@ -3685,7 +4069,7 @@ export default {
         }
         const respReq = parsed.value as any;
         const providerHint = respReq.provider ?? respReq.owned_by ?? respReq.ownedBy ?? respReq.owner ?? respReq.vendor;
-        const resolved = resolveModel(gatewayCfg.config, respReq.model, providerHint);
+        const resolved = resolveModel(gatewayCfg.config, respReq.model, providerHint, request, reqId);
         if (resolved.ok === false) return withCors(jsonResponse(resolved.status, resolved.error), corsHeaders);
 
         const stream = Boolean(respReq.stream);
@@ -3813,7 +4197,7 @@ export default {
         }
         const claudeReq = parsed.value as any;
         const providerHint = claudeReq.provider ?? claudeReq.owned_by ?? claudeReq.ownedBy ?? claudeReq.owner ?? claudeReq.vendor;
-        const resolved = resolveModel(gatewayCfg.config, claudeReq.model, providerHint);
+        const resolved = resolveModel(gatewayCfg.config, claudeReq.model, providerHint, request, reqId);
         if (resolved.ok === false) return withCors(jsonResponse(resolved.status, resolved.error), corsHeaders);
 
         const converted = claudeMessagesRequestToOpenaiChat(claudeReq);
@@ -3861,7 +4245,7 @@ export default {
         }
         const reqJson = parsed.value as any;
         const providerHint = reqJson.provider ?? reqJson.owned_by ?? reqJson.ownedBy ?? reqJson.owner ?? reqJson.vendor;
-        const resolved = resolveModel(gatewayCfg.config, reqJson.model, providerHint);
+        const resolved = resolveModel(gatewayCfg.config, reqJson.model, providerHint, request, reqId);
         if (resolved.ok === false) return withCors(jsonResponse(resolved.status, resolved.error), corsHeaders);
         reqJson.model = resolved.model.upstreamModel;
 
@@ -3918,7 +4302,7 @@ export default {
         const stream = methodName === "streamGenerateContent";
 
         const providerHint = url.searchParams.get("provider") || url.searchParams.get("owned_by") || url.searchParams.get("ownedBy") || "";
-        const resolved = resolveModel(gatewayCfg.config, modelId, providerHint);
+        const resolved = resolveModel(gatewayCfg.config, modelId, providerHint, request, reqId);
         if (resolved.ok === false) return withCors(jsonResponse(resolved.status, resolved.error), corsHeaders);
 
         const parsed = await readJsonBody(request);

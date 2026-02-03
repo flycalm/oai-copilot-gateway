@@ -1,0 +1,34 @@
+{
+  "version": 2,
+  "providers": {
+    "openai": {
+      "apiMode": "openai-responses",
+      "baseURL": "https://your-relay.example/openai",
+      "apiKeyEnv": "OPENAI_API_KEY"
+    },
+    "ds": {
+      "apiMode": "openai-chat-completions",
+      "baseURL": "https://api.deepseek.com",
+      "apiKeyEnv": "DEEPSEEK_API_KEY"
+    }
+  },
+  "models": {
+    "gpt-5.2": { "upstreamModel": "gpt-5.2" },
+    "deepseek-chat": { "upstreamModel": "deepseek-chat" }
+  },
+  "routes": {
+    "gpt-5.2": {
+      "strategy": "priority",
+      "providers": [
+        { "providerId": "openai", "upstreamModel": "gpt-5.2" }
+      ]
+    },
+    "deepseek-chat": {
+      "strategy": "priority",
+      "providers": [
+        { "providerId": "ds", "upstreamModel": "deepseek-chat" }
+      ]
+    }
+  }
+}
+
