@@ -1585,6 +1585,7 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
   let sawAnyReasoning = false;
   let bytesIn = 0;
   let sseDataLines = 0;
+  let usageMetadata: any = null;
 
   const toolCallKeyToMeta = new Map(); // key -> { id, index, name, args }
   let nextToolIndex = 0;
@@ -1731,6 +1732,9 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
           } catch {
             continue;
           }
+
+          // Keep the latest usageMetadata if present.
+          if (payload?.usageMetadata && typeof payload.usageMetadata === "object") usageMetadata = payload.usageMetadata;
 
           const candidates = Array.isArray(payload?.candidates) ? payload.candidates : [];
           const cand = candidates.length ? candidates[0] : null;
@@ -1986,18 +1990,21 @@ export async function handleGeminiChatCompletions({ request, env, reqJson, model
           })),
           finish_reason: overrideFinishReason || geminiFinishReasonToOpenai(lastFinishReason, toolCallKeyToMeta.size > 0),
           textLen: textSoFar.length,
+          usage: usageMetadata ? geminiUsageToOpenaiUsage(usageMetadata) : null,
         });
       }
 
       if (!sentFinal) {
         try {
           const finishReason = overrideFinishReason || geminiFinishReasonToOpenai(lastFinishReason, toolCallKeyToMeta.size > 0);
+          const usage = geminiUsageToOpenaiUsage(usageMetadata);
           const finalChunk = {
             id: chatId,
             object: "chat.completion.chunk",
             created,
             model: outModel,
             choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+            ...(usage ? { usage } : {}),
           };
           await writer.write(encoder.encode(encodeSseData(JSON.stringify(finalChunk))));
         } catch {

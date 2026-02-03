@@ -404,6 +404,7 @@ export async function handleClaudeChatCompletions({ request, env, reqJson, model
     let textContent = "";
     const toolCalls: any[] = [];
     let finishReason = "stop";
+    let usageObj: any = null;
     const emitReasoningDelta = async (deltaText) => {
       if (typeof deltaText !== "string" || !deltaText) return;
       const chunk = {
@@ -442,6 +443,12 @@ export async function handleClaudeChatCompletions({ request, env, reqJson, model
           } catch {
             continue;
           }
+
+          // Track usage if present (Anthropic streaming may emit it on message_start / message_delta / message_stop).
+          try {
+            const u = event?.message?.usage ?? event?.usage ?? event?.delta?.usage ?? null;
+            if (u && typeof u === "object") usageObj = u;
+          } catch {}
 
           if (event.type === "content_block_start") {
             if (event.content_block?.type === "tool_use") {
@@ -531,12 +538,14 @@ export async function handleClaudeChatCompletions({ request, env, reqJson, model
       }
 
       // Final chunk with finish_reason
+      const usage = claudeUsageToOpenaiUsage(usageObj);
       const finalChunk = {
         id: chatId,
         object: "chat.completion.chunk",
         created,
         model: claudeModel,
         choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+        ...(usage ? { usage } : {}),
       };
       await writer.write(encoder.encode(encodeSseData(JSON.stringify(finalChunk))));
       await writer.write(encoder.encode(encodeSseData("[DONE]")));
@@ -551,6 +560,7 @@ export async function handleClaudeChatCompletions({ request, env, reqJson, model
           textLen: textContent.length,
           toolCallsCount: toolCalls.length,
           finish_reason: finishReason,
+          usage: usageObj ? claudeUsageToOpenaiUsage(usageObj) : null,
         });
       }
       try {

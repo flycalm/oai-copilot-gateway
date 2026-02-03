@@ -42,6 +42,7 @@ import { geminiRequestToOpenAIChat, openAIChatResponseToGemini } from "./protoco
 import { openAIChatResponseToResponses, responsesRequestToOpenAIChat } from "./protocols/responses";
 import { openAIChatSseToGeminiSse, openAIChatSseToResponsesSse } from "./protocols/stream";
 import { listUpstreamCandidates, shouldTryNextUpstreamCandidateStatus } from "./upstreams";
+import { instrumentResponseAndRecordTokens, tokenMetrics, tokenMetricsErrorResponse } from "./metrics";
 
 function getCorsHeaders(request: Request): Record<string, string> {
   const origin = request.headers.get("origin") || "";
@@ -530,6 +531,44 @@ function webUiHtml(): string {
     .mt-md{ margin-top:12px; }
     .mt-lg{ margin-top:20px; }
     .hidden{ display:none !important; }
+
+    /* Token stats */
+    .toggle-row{ display:flex; align-items:center; gap:10px; }
+    .toggle-row input[type="checkbox"]{ width:16px; height:16px; }
+    .token-layout{ display:grid; grid-template-columns: 1.2fr 0.8fr; gap:16px; }
+    .token-col{ min-width:0; }
+    @media (max-width: 1000px){
+      .token-layout{ grid-template-columns: 1fr; }
+    }
+    .token-card{ background: var(--card); border: 1px solid var(--border); box-shadow: var(--shadow); }
+    .token-kpis{ display:grid; grid-template-columns: 1fr 1fr; gap:12px; }
+    @media (max-width: 700px){
+      .token-kpis{ grid-template-columns: 1fr; }
+    }
+    .token-kpi{ padding:12px; border-radius:10px; border:1px solid var(--border-light); background: color-mix(in oklab, var(--card) 80%, transparent); }
+    .token-kpi-title{ color: var(--text-secondary); font-size:12px; margin-bottom:6px; }
+    .token-kpi-value{ font-size:26px; font-weight:800; letter-spacing: .2px; }
+    .token-chart-wrap{ height: 240px; position: relative; }
+    .token-chart-wrap canvas{ width:100%; height:100%; display:block; }
+    .token-groups{ display:flex; flex-direction:column; gap:10px; }
+    .token-group{ padding:10px; border-radius:10px; border:1px solid var(--border-light); background: color-mix(in oklab, var(--card) 86%, transparent); }
+    .token-group-top{ display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }
+    .token-group-name{ font-weight:700; }
+    .token-group-meta{ color: var(--text-secondary); font-size:12px; }
+    .token-bar{ height:10px; border-radius:999px; background: color-mix(in oklab, var(--border) 70%, transparent); overflow:hidden; margin-top:8px; }
+    .token-bar > div{ height:100%; background: linear-gradient(90deg, var(--accent), var(--accent-light)); width:0%; transition: width .25s ease; }
+    .token-controls{ display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    .token-controls select{ padding:10px 12px; border-radius:10px; border:1px solid var(--border); background: var(--bg); color: var(--text); outline:none; }
+    .token-controls button{ padding:10px 12px; border-radius:10px; border:1px solid var(--border); background: var(--bg); color: var(--text); cursor:pointer; }
+    .token-controls button:hover{ border-color: var(--accent); }
+    .token-table-wrap{ overflow:auto; border-radius:12px; border:1px solid var(--border); }
+    .token-table{ width:100%; border-collapse: collapse; min-width: 900px; }
+    .token-table th, .token-table td{ padding:10px 12px; border-bottom:1px solid var(--border); text-align:left; vertical-align:top; }
+    .token-table th{ position: sticky; top: 0; background: color-mix(in oklab, var(--card) 92%, transparent); z-index:1; }
+    .token-table tr:hover td{ background: color-mix(in oklab, var(--card-hover) 70%, transparent); }
+    .tok-badge{ display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; font-weight:700; border:1px solid var(--border); }
+    .tok-ok{ color: var(--success); border-color: color-mix(in oklab, var(--success) 60%, var(--border)); background: color-mix(in oklab, var(--success) 14%, transparent); }
+    .tok-err{ color: var(--error); border-color: color-mix(in oklab, var(--error) 60%, var(--border)); background: color-mix(in oklab, var(--error) 14%, transparent); }
   </style>
 </head>
 <body>
@@ -541,6 +580,7 @@ function webUiHtml(): string {
       </div>
 	      <nav class="nav-tabs" id="navTabs">
 	        <button class="nav-tab active" data-tab="dashboard">概览</button>
+	        <button class="nav-tab" data-tab="tokens">Token 统计</button>
 	        <button class="nav-tab" data-tab="config">配置管理</button>
 	        <button class="nav-tab" data-tab="test">API 测试</button>
 	        <button class="nav-tab" data-tab="dist">分发测试</button>
@@ -578,6 +618,112 @@ function webUiHtml(): string {
         <div class="col card">
           <h2>📡 响应结果</h2>
           <pre id="out" class="muted">点击左侧按钮开始</pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- Tokens Tab -->
+    <div id="tab-tokens" class="tab-content fade-in">
+      <div class="card">
+        <h1>🧮 Token 统计</h1>
+        <p class="muted">
+          实时统计每次调用的 Token、每日用量趋势，并支持按上游分组查看。<br>
+          <strong>提示：</strong>当前实现为内存统计（重启服务会清空）；通过 <code>WEB_UI_ENABLED=true</code> 或 <code>RSP4COPILOT_TOKEN_STATS_ENABLED=true</code> 启用。
+        </p>
+
+        <div class="mt-lg grid">
+          <div>
+            <label>时间范围</label>
+            <select id="tokDays">
+              <option value="7">最近 7 天</option>
+              <option value="30" selected>最近 30 天</option>
+              <option value="90">最近 90 天</option>
+            </select>
+          </div>
+          <div>
+            <label>分组维度</label>
+            <select id="tokGroupBy">
+              <option value="upstream" selected>按上游（provider/upstream）</option>
+              <option value="provider">按 Provider</option>
+            </select>
+          </div>
+          <div style="display:flex; align-items:flex-end">
+            <button class="primary" id="tokRefresh" style="width:100%">🔄 刷新概览</button>
+          </div>
+          <div>
+            <label>实时刷新</label>
+            <div class="toggle-row">
+              <input type="checkbox" id="tokAuto" checked />
+              <span class="muted">每 2 秒拉取最近请求</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="mt-lg token-layout">
+          <div class="token-col">
+            <div class="card token-card">
+              <h2>📈 每日用量</h2>
+              <div class="token-kpis mt-md">
+                <div class="token-kpi">
+                  <div class="token-kpi-title">总 Token</div>
+                  <div id="tokTotal" class="token-kpi-value">-</div>
+                  <div id="tokTotalSub" class="muted">请求 - | 缓存 -</div>
+                </div>
+                <div class="token-kpi">
+                  <div class="token-kpi-title">输入/输出</div>
+                  <div id="tokInOut" class="token-kpi-value">-</div>
+                  <div class="muted">Prompt / Completion</div>
+                </div>
+              </div>
+              <div class="token-chart-wrap mt-md">
+                <canvas id="tokDailyChart"></canvas>
+              </div>
+              <div class="muted mt-sm" id="tokOverviewHint"></div>
+            </div>
+          </div>
+          <div class="token-col">
+            <div class="card token-card">
+              <h2>🧩 上游分布</h2>
+              <div id="tokGroups" class="mt-md"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="mt-lg card token-card">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+            <h2 style="margin:0;">🕒 最近请求（实时）</h2>
+            <div class="token-controls">
+              <select id="tokRecentGroupFilter">
+                <option value="">全部上游</option>
+              </select>
+              <select id="tokRecentStreamFilter">
+                <option value="">全部模式</option>
+                <option value="false">非流式</option>
+                <option value="true">流式</option>
+              </select>
+              <button id="tokClear">清空显示</button>
+            </div>
+          </div>
+          <div class="muted mt-sm" id="tokRecentStatus"></div>
+          <div class="token-table-wrap mt-md">
+            <table class="token-table" id="tokRecentTable">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>上游</th>
+                  <th>模型</th>
+                  <th>输入</th>
+                  <th>输出</th>
+                  <th>总计</th>
+                  <th>缓存</th>
+                  <th>耗时</th>
+                  <th>流式</th>
+                  <th>状态</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
         </div>
       </div>
     </div>
@@ -784,6 +930,15 @@ function webUiHtml(): string {
         if (targetContent) {
           targetContent.classList.add('active', 'fade-in');
         }
+
+        // Token 统计页：进入时启动刷新/轮询，离开时停止轮询
+        try {
+          if (targetTab === 'tokens') {
+            ensureTokensTab();
+          } else {
+            stopTokPolling();
+          }
+        } catch {}
       });
     });
 
@@ -814,6 +969,21 @@ function webUiHtml(): string {
 		    const upKeysFormEl = document.getElementById('upKeysForm');
 	    const upKeysRevealEl = document.getElementById('upKeysReveal');
 	    const upKeysStatusEl = document.getElementById('upKeysStatus');
+	    const tokDaysEl = document.getElementById('tokDays');
+	    const tokGroupByEl = document.getElementById('tokGroupBy');
+	    const tokRefreshEl = document.getElementById('tokRefresh');
+	    const tokAutoEl = document.getElementById('tokAuto');
+	    const tokTotalEl = document.getElementById('tokTotal');
+	    const tokTotalSubEl = document.getElementById('tokTotalSub');
+	    const tokInOutEl = document.getElementById('tokInOut');
+	    const tokDailyChartEl = document.getElementById('tokDailyChart');
+	    const tokGroupsEl = document.getElementById('tokGroups');
+	    const tokOverviewHintEl = document.getElementById('tokOverviewHint');
+	    const tokRecentTableEl = document.getElementById('tokRecentTable');
+	    const tokRecentStatusEl = document.getElementById('tokRecentStatus');
+	    const tokRecentGroupFilterEl = document.getElementById('tokRecentGroupFilter');
+	    const tokRecentStreamFilterEl = document.getElementById('tokRecentStreamFilter');
+	    const tokClearEl = document.getElementById('tokClear');
 
     function setOut(text, isErr){
       outEl.className = isErr ? '' : '';
@@ -911,6 +1081,381 @@ function webUiHtml(): string {
       const prefix = (r && r.url) ? (String(r.method || 'GET').toUpperCase() + ' ' + String(r.url) + '\\n') : '';
       return prefix + 'HTTP ' + r.status + '\\n' + JSON.stringify(r.headers, null, 2) + '\\n\\n' + body;
     }
+
+    // =========================
+    // Token stats (UI)
+    // =========================
+    function fmtInt(v){
+      const n = Number(v);
+      if (!Number.isFinite(n)) return 0;
+      return Math.max(0, Math.floor(n));
+    }
+    function fmtTokens(v){
+      const n = fmtInt(v);
+      if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(2) + 'B';
+      if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M';
+      if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K';
+      return String(n);
+    }
+    function fmtMs(v){
+      const n = fmtInt(v);
+      if (n >= 1000) return (n / 1000).toFixed(2) + 's';
+      return n + 'ms';
+    }
+    function safeJson(text){
+      try { return JSON.parse(String(text || '')); } catch { return null; }
+    }
+    async function callGatewayJson(path, opt){
+      const r = await callGateway(path, opt);
+      return Object.assign({}, r, { json: safeJson(r.text) });
+    }
+
+    function isTokensTabActive(){
+      const el = document.getElementById('tab-tokens');
+      return !!(el && el.classList.contains('active'));
+    }
+
+    function drawLineChart(canvas, labels, values){
+      if (!canvas || typeof canvas.getContext !== 'function') return;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      const dpr = Math.max(1, (window.devicePixelRatio || 1));
+      const w = Math.max(320, canvas.clientWidth || 640);
+      const h = Math.max(180, canvas.clientHeight || 240);
+      canvas.width = Math.floor(w * dpr);
+      canvas.height = Math.floor(h * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      const padL = 44, padR = 16, padT = 16, padB = 28;
+      const iw = w - padL - padR;
+      const ih = h - padT - padB;
+
+      ctx.clearRect(0, 0, w, h);
+
+      const maxV = Math.max(1, ...values.map(v => fmtInt(v)));
+      const minV = 0;
+
+      // Grid
+      ctx.strokeStyle = 'rgba(148, 163, 184, 0.18)';
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= 4; i++){
+        const y = padT + (ih * i) / 4;
+        ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + iw, y); ctx.stroke();
+      }
+
+      // Y labels
+      ctx.fillStyle = 'rgba(148, 163, 184, 0.9)';
+      ctx.font = '12px ui-sans-serif, system-ui';
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'middle';
+      for (let i = 0; i <= 4; i++){
+        const v = maxV - (maxV - minV) * (i / 4);
+        const y = padT + (ih * i) / 4;
+        ctx.fillText(fmtTokens(v), padL - 10, y);
+      }
+
+      if (!values.length) return;
+
+      const xAt = (idx) => padL + (iw * (values.length === 1 ? 0 : idx / (values.length - 1)));
+      const yAt = (v) => padT + ih - (ih * (fmtInt(v) - minV)) / (maxV - minV || 1);
+
+      // Area
+      ctx.beginPath();
+      ctx.moveTo(xAt(0), padT + ih);
+      for (let i = 0; i < values.length; i++){
+        ctx.lineTo(xAt(i), yAt(values[i]));
+      }
+      ctx.lineTo(xAt(values.length - 1), padT + ih);
+      ctx.closePath();
+      const grad = ctx.createLinearGradient(0, padT, 0, padT + ih);
+      grad.addColorStop(0, 'rgba(59, 130, 246, 0.28)');
+      grad.addColorStop(1, 'rgba(59, 130, 246, 0.02)');
+      ctx.fillStyle = grad;
+      ctx.fill();
+
+      // Line
+      ctx.beginPath();
+      for (let i = 0; i < values.length; i++){
+        const x = xAt(i);
+        const y = yAt(values[i]);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.strokeStyle = 'rgba(96, 165, 250, 0.95)';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // X labels (first / middle / last)
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      const idxs = values.length <= 2 ? [0, values.length - 1] : [0, Math.floor((values.length - 1) / 2), values.length - 1];
+      const uniq = Array.from(new Set(idxs)).filter(i => i >= 0 && i < labels.length);
+      for (const i of uniq){
+        const x = xAt(i);
+        const lab = String(labels[i] || '');
+        ctx.fillText(lab.slice(5), x, padT + ih + 8);
+      }
+    }
+
+    function setTokStatus(text){
+      if (!tokRecentStatusEl) return;
+      tokRecentStatusEl.textContent = String(text || '');
+    }
+
+    let tokSince = 0;
+    let tokPollTimer = null;
+    let tokOverviewCache = null;
+    let tokRecentCache = [];
+
+    function fillTokGroupFilterOptions(groups, groupBy){
+      if (!tokRecentGroupFilterEl) return;
+      const keep = String(tokRecentGroupFilterEl.value || '');
+      tokRecentGroupFilterEl.innerHTML = '';
+      const opt0 = document.createElement('option');
+      opt0.value = '';
+      opt0.textContent = groupBy === 'provider' ? '全部 Provider' : '全部上游';
+      tokRecentGroupFilterEl.appendChild(opt0);
+
+      const max = 60;
+      const list = Array.isArray(groups) ? groups.slice(0, max) : [];
+      for (const g of list){
+        const key = String(g && g.key ? g.key : '');
+        const providerId = String(g && g.providerId ? g.providerId : '');
+        const upstreamId = String(g && g.upstreamId ? g.upstreamId : '');
+        const v = groupBy === 'provider' ? (providerId + '::') : (providerId + '::' + upstreamId);
+        const opt = document.createElement('option');
+        opt.value = v;
+        opt.textContent = key;
+        tokRecentGroupFilterEl.appendChild(opt);
+      }
+      if (keep) tokRecentGroupFilterEl.value = keep;
+    }
+
+    function renderTokGroups(groups, totalTokens){
+      if (!tokGroupsEl) return;
+      tokGroupsEl.innerHTML = '';
+      const wrap = document.createElement('div');
+      wrap.className = 'token-groups';
+      const list = Array.isArray(groups) ? groups.slice(0, 10) : [];
+      const denom = Math.max(1, fmtInt(totalTokens));
+      if (!list.length){
+        const empty = document.createElement('div');
+        empty.className = 'muted';
+        empty.textContent = '暂无数据（等待产生调用记录后再刷新）';
+        tokGroupsEl.appendChild(empty);
+        return;
+      }
+      for (const g of list){
+        const key = String(g && g.key ? g.key : '');
+        const tokens = fmtInt(g && g.totalTokens);
+        const reqs = fmtInt(g && g.requests);
+        const pct = Math.max(0, Math.min(100, Math.round((tokens / denom) * 100)));
+
+        const card = document.createElement('div');
+        card.className = 'token-group';
+        const top = document.createElement('div');
+        top.className = 'token-group-top';
+        const left = document.createElement('div');
+        const name = document.createElement('div');
+        name.className = 'token-group-name';
+        name.textContent = key || '(unknown)';
+        const meta = document.createElement('div');
+        meta.className = 'token-group-meta';
+        meta.textContent = '请求 ' + reqs + ' · Token ' + fmtTokens(tokens) + ' · ' + pct + '%';
+        left.appendChild(name);
+        left.appendChild(meta);
+        const right = document.createElement('div');
+        right.className = 'token-group-meta';
+        right.textContent = fmtTokens(tokens);
+        top.appendChild(left);
+        top.appendChild(right);
+
+        const bar = document.createElement('div');
+        bar.className = 'token-bar';
+        const fill = document.createElement('div');
+        fill.style.width = pct + '%';
+        bar.appendChild(fill);
+
+        card.appendChild(top);
+        card.appendChild(bar);
+        wrap.appendChild(card);
+      }
+      tokGroupsEl.appendChild(wrap);
+    }
+
+    function renderTokRecent(records){
+      const table = tokRecentTableEl;
+      if (!table) return;
+      const tbody = table.querySelector('tbody');
+      if (!tbody) return;
+      tbody.innerHTML = '';
+
+      const streamFilter = tokRecentStreamFilterEl ? String(tokRecentStreamFilterEl.value || '') : '';
+      const list = Array.isArray(records) ? records : [];
+      const filtered = list.filter(r => {
+        if (!streamFilter) return true;
+        return String(Boolean(r && r.stream)) === streamFilter;
+      }).slice(0, 200);
+
+      for (const r of filtered){
+        const tr = document.createElement('tr');
+        const usage = r && r.usage ? r.usage : null;
+        const ts = fmtInt(r && r.ts);
+        const timeStr = ts ? new Date(ts).toLocaleString('zh-CN', { hour12: false }) : '-';
+        const providerId = String(r && r.providerId ? r.providerId : '');
+        const upstreamId = String(r && r.upstreamId ? r.upstreamId : '');
+        const upstreamLabel = upstreamId && upstreamId !== providerId ? (providerId + '/' + upstreamId) : (providerId || upstreamId || '-');
+        const model = String(r && r.model ? r.model : '');
+        const prompt = usage ? fmtTokens(usage.prompt_tokens) : '-';
+        const completion = usage ? fmtTokens(usage.completion_tokens) : '-';
+        const total = usage ? fmtTokens(usage.total_tokens) : '-';
+        const cached = usage && usage.cached_tokens ? fmtTokens(usage.cached_tokens) : '-';
+        const latency = r && r.latencyMs != null ? fmtMs(r.latencyMs) : '-';
+        const stream = r && r.stream ? '是' : '否';
+        const statusOk = (r && r.status) ? String(r.status) === 'ok' : true;
+
+        const td = (text) => {
+          const c = document.createElement('td');
+          c.textContent = String(text);
+          return c;
+        };
+
+        tr.appendChild(td(timeStr));
+        tr.appendChild(td(upstreamLabel));
+        tr.appendChild(td(model || '-'));
+        tr.appendChild(td(prompt));
+        tr.appendChild(td(completion));
+        tr.appendChild(td(total));
+        tr.appendChild(td(cached));
+        tr.appendChild(td(latency));
+        tr.appendChild(td(stream));
+        const st = document.createElement('td');
+        const badge = document.createElement('span');
+        badge.className = 'tok-badge ' + (statusOk ? 'tok-ok' : 'tok-err');
+        badge.textContent = statusOk ? 'OK' : 'ERR';
+        st.appendChild(badge);
+        tr.appendChild(st);
+        tbody.appendChild(tr);
+      }
+    }
+
+    async function loadTokOverview(){
+      if (!tokDaysEl || !tokGroupByEl) return;
+      const days = String(tokDaysEl.value || '30').trim() || '30';
+      const groupBy = String(tokGroupByEl.value || 'upstream').trim() || 'upstream';
+      if (tokOverviewHintEl) tokOverviewHintEl.textContent = '加载中...';
+      const r = await callGatewayJson('/v1/metrics/tokens/overview?days=' + encodeURIComponent(days) + '&groupBy=' + encodeURIComponent(groupBy), { method: 'GET' });
+      if (r.status >= 400 || !r.json || r.json.ok !== true){
+        if (tokOverviewHintEl) tokOverviewHintEl.textContent = '加载失败：HTTP ' + r.status + '（请确认已启用 Token 统计）';
+        if (tokTotalEl) tokTotalEl.textContent = '-';
+        if (tokTotalSubEl) tokTotalSubEl.textContent = '';
+        if (tokInOutEl) tokInOutEl.textContent = '-';
+        if (tokGroupsEl) tokGroupsEl.innerHTML = '<div class="muted">暂无数据</div>';
+        return;
+      }
+
+      tokOverviewCache = r.json;
+      const totals = r.json.totals || {};
+      const totalTokens = fmtInt(totals.totalTokens);
+      const promptTokens = fmtInt(totals.promptTokens);
+      const completionTokens = fmtInt(totals.completionTokens);
+      const cachedTokens = fmtInt(totals.cachedTokens);
+      const requests = fmtInt(totals.requests);
+      if (tokTotalEl) tokTotalEl.textContent = fmtTokens(totalTokens);
+      if (tokTotalSubEl) tokTotalSubEl.textContent = '请求 ' + requests + ' | 缓存 ' + fmtTokens(cachedTokens);
+      if (tokInOutEl) tokInOutEl.textContent = fmtTokens(promptTokens) + ' / ' + fmtTokens(completionTokens);
+      if (tokOverviewHintEl) tokOverviewHintEl.textContent = '范围：' + String(r.json.from || '-') + ' ~ ' + String(r.json.to || '-') + '（按 ' + (groupBy === 'provider' ? 'Provider' : '上游') + ' 分组）';
+
+      const daysList = Array.isArray(r.json.days) ? r.json.days : [];
+      const labels = daysList.map(d => String(d && d.date ? d.date : ''));
+      const values = daysList.map(d => fmtInt(d && d.totalTokens));
+      drawLineChart(tokDailyChartEl, labels, values);
+
+      const groups = Array.isArray(r.json.groups) ? r.json.groups : [];
+      renderTokGroups(groups, totalTokens);
+      fillTokGroupFilterOptions(groups, groupBy);
+    }
+
+    async function pollTokRecentOnce(){
+      if (!isTokensTabActive()) return;
+      const auto = tokAutoEl ? Boolean(tokAutoEl.checked) : false;
+      if (!auto) return;
+
+      let provider = '';
+      let upstream = '';
+      const gf = tokRecentGroupFilterEl ? String(tokRecentGroupFilterEl.value || '') : '';
+      if (gf) {
+        const [p, u] = gf.split('::');
+        provider = String(p || '').trim();
+        upstream = String(u || '').trim();
+      }
+
+      const qs = new URLSearchParams();
+      qs.set('since', String(tokSince || 0));
+      qs.set('limit', '200');
+      if (provider) qs.set('provider', provider);
+      if (upstream) qs.set('upstream', upstream);
+      const r = await callGatewayJson('/v1/metrics/tokens/recent?' + qs.toString(), { method: 'GET' });
+      if (r.status >= 400 || !r.json || r.json.ok !== true){
+        setTokStatus('拉取失败：HTTP ' + r.status + '（请确认已启用 Token 统计，并确保入口 Key/代理可用）');
+        return;
+      }
+
+      const nextSince = fmtInt(r.json.nextSince);
+      const incoming = Array.isArray(r.json.records) ? r.json.records : [];
+      if (nextSince) tokSince = Math.max(tokSince, nextSince);
+
+      const merged = incoming.concat(tokRecentCache);
+      const seen = new Set();
+      const out = [];
+      for (const it of merged){
+        const key = String(it && it.reqId ? it.reqId : '') + ':' + String(it && it.ts ? it.ts : '') + ':' + String(it && it.providerId ? it.providerId : '') + ':' + String(it && it.upstreamId ? it.upstreamId : '');
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(it);
+        if (out.length >= 220) break;
+      }
+      tokRecentCache = out;
+      const statusText =
+        '最近记录：' + tokRecentCache.length + ' 条' +
+        (provider ? (' · 过滤：' + provider + (upstream ? '/' + upstream : '')) : '') +
+        (tokSince ? (' · since=' + tokSince) : '');
+      setTokStatus(statusText);
+      renderTokRecent(tokRecentCache);
+    }
+
+    function startTokPolling(){
+      if (tokPollTimer) return;
+      tokPollTimer = setInterval(() => { pollTokRecentOnce(); }, 2000);
+    }
+    function stopTokPolling(){
+      if (!tokPollTimer) return;
+      try { clearInterval(tokPollTimer); } catch {}
+      tokPollTimer = null;
+    }
+    async function ensureTokensTab(){
+      if (!isTokensTabActive()) return;
+      await loadTokOverview();
+      await pollTokRecentOnce();
+      startTokPolling();
+    }
+
+    tokRefreshEl?.addEventListener('click', () => { ensureTokensTab(); });
+    tokDaysEl?.addEventListener('change', () => { ensureTokensTab(); });
+    tokGroupByEl?.addEventListener('change', () => { ensureTokensTab(); });
+    tokRecentGroupFilterEl?.addEventListener('change', () => { tokSince = 0; tokRecentCache = []; pollTokRecentOnce(); });
+    tokRecentStreamFilterEl?.addEventListener('change', () => { renderTokRecent(tokRecentCache); });
+    tokAutoEl?.addEventListener('change', () => { if (tokAutoEl.checked) pollTokRecentOnce(); });
+    tokClearEl?.addEventListener('click', () => { tokSince = 0; tokRecentCache = []; renderTokRecent([]); setTokStatus('已清空显示'); });
+    window.addEventListener('resize', () => {
+      try{
+        if (!isTokensTabActive() || !tokOverviewCache) return;
+        const daysList = Array.isArray(tokOverviewCache.days) ? tokOverviewCache.days : [];
+        const labels = daysList.map(d => String(d && d.date ? d.date : ''));
+        const values = daysList.map(d => fmtInt(d && d.totalTokens));
+        drawLineChart(tokDailyChartEl, labels, values);
+      } catch {}
+    });
 
     document.getElementById('btnHealth').addEventListener('click', async () => {
       try { const r = await callGateway('/v1/health', { method: 'GET' }); setOut(pretty(r)); } catch (e) { setOut(String(e && e.message ? e.message : e), true); }
@@ -2888,6 +3433,34 @@ export default {
         return withCors(jsonResponse(200, { ok: true, time: Math.floor(Date.now() / 1000) }), corsHeaders);
       }
 
+      // Token metrics (in-memory; opt-in via WEB_UI_ENABLED or RSP4COPILOT_TOKEN_STATS_ENABLED)
+      const metricsEnabled = parseBoolEnv((env as any)?.RSP4COPILOT_TOKEN_STATS_ENABLED) || parseBoolEnv((env as any)?.WEB_UI_ENABLED);
+      if (request.method === "GET" && path.startsWith("/v1/metrics/tokens")) {
+        if (!metricsEnabled) {
+          return withCors(jsonResponse(404, tokenMetricsErrorResponse("Token 统计未启用（设置 WEB_UI_ENABLED=true 或 RSP4COPILOT_TOKEN_STATS_ENABLED=true）", "not_found")), corsHeaders);
+        }
+
+        if (path === "/v1/metrics/tokens/recent") {
+          const limit = Number(url.searchParams.get("limit") || 200);
+          const sinceTs = Number(url.searchParams.get("since") || 0);
+          const providerId = url.searchParams.get("provider") || "";
+          const upstreamId = url.searchParams.get("upstream") || "";
+          const records = tokenMetrics.getRecent({ limit, sinceTs, providerId, upstreamId });
+          const nextSince = records.reduce((m, r) => (r.ts > m ? r.ts : m), sinceTs || 0);
+          return withCors(jsonResponse(200, { ok: true, now: Date.now(), nextSince, records }), corsHeaders);
+        }
+
+        if (path === "/v1/metrics/tokens/overview") {
+          const days = Number(url.searchParams.get("days") || 30);
+          const groupByRaw = (url.searchParams.get("groupBy") || "").trim().toLowerCase();
+          const groupBy = groupByRaw === "provider" ? "provider" : "upstream";
+          const overview = tokenMetrics.getOverview({ days, groupBy });
+          return withCors(jsonResponse(200, { ok: true, now: Date.now(), groupBy, ...overview }), corsHeaders);
+        }
+
+        return withCors(jsonResponse(404, jsonError("Not found", "not_found")), corsHeaders);
+      }
+
       // Models list
       if (
         request.method === "GET" &&
@@ -3067,9 +3640,23 @@ export default {
             extraSystemText,
           });
 
-          lastResp = resp;
-          if (resp.ok) return withCors(resp, corsHeaders);
-          if (!shouldTryNextUpstreamCandidateStatus(resp.status) || i === upstreamCandidates.length - 1) return withCors(resp, corsHeaders);
+          const shouldStop = resp.ok || !shouldTryNextUpstreamCandidateStatus(resp.status) || i === upstreamCandidates.length - 1;
+          const outResp =
+            metricsEnabled && shouldStop
+              ? await instrumentResponseAndRecordTokens(resp, {
+                  ts: typeof startedAt === "number" && Number.isFinite(startedAt) ? startedAt : Date.now(),
+                  reqId,
+                  path,
+                  stream,
+                  providerId: resolved.provider.id,
+                  upstreamId: upstream.id || resolved.provider.id,
+                  model: resolved.model.name || resolved.model.upstreamModel,
+                })
+              : resp;
+
+          lastResp = outResp;
+          if (outResp.ok) return withCors(outResp, corsHeaders);
+          if (shouldStop) return withCors(outResp, corsHeaders);
         }
 
         return withCors(lastResp || jsonResponse(502, jsonError("Upstream error", "bad_gateway")), corsHeaders);
@@ -3142,9 +3729,24 @@ export default {
               startedAt,
             });
 
-            lastResp = upstreamResp;
-            if (upstreamResp.ok) return withCors(upstreamResp, corsHeaders);
-            if (!shouldTryNextUpstreamCandidateStatus(upstreamResp.status) || i === upstreamCandidates.length - 1) return withCors(upstreamResp, corsHeaders);
+            const shouldStop =
+              upstreamResp.ok || !shouldTryNextUpstreamCandidateStatus(upstreamResp.status) || i === upstreamCandidates.length - 1;
+            const outResp =
+              metricsEnabled && shouldStop
+                ? await instrumentResponseAndRecordTokens(upstreamResp, {
+                    ts: typeof startedAt === "number" && Number.isFinite(startedAt) ? startedAt : Date.now(),
+                    reqId,
+                    path,
+                    stream,
+                    providerId: resolved.provider.id,
+                    upstreamId: upstream.id || resolved.provider.id,
+                    model: resolved.model.name || resolved.model.upstreamModel,
+                  })
+                : upstreamResp;
+
+            lastResp = outResp;
+            if (outResp.ok) return withCors(outResp, corsHeaders);
+            if (shouldStop) return withCors(outResp, corsHeaders);
           }
 
           return withCors(lastResp || jsonResponse(502, jsonError("Upstream error", "bad_gateway")), corsHeaders);
@@ -3340,9 +3942,24 @@ export default {
               reqId,
             });
 
-            lastResp = upstreamResp;
-            if (upstreamResp.ok) return withCors(upstreamResp, corsHeaders);
-            if (!shouldTryNextUpstreamCandidateStatus(upstreamResp.status) || i === upstreamCandidates.length - 1) return withCors(upstreamResp, corsHeaders);
+            const shouldStop =
+              upstreamResp.ok || !shouldTryNextUpstreamCandidateStatus(upstreamResp.status) || i === upstreamCandidates.length - 1;
+            const outResp =
+              metricsEnabled && shouldStop
+                ? await instrumentResponseAndRecordTokens(upstreamResp, {
+                    ts: typeof startedAt === "number" && Number.isFinite(startedAt) ? startedAt : Date.now(),
+                    reqId,
+                    path,
+                    stream,
+                    providerId: resolved.provider.id,
+                    upstreamId: upstream.id || resolved.provider.id,
+                    model: resolved.model.name || resolved.model.upstreamModel,
+                  })
+                : upstreamResp;
+
+            lastResp = outResp;
+            if (outResp.ok) return withCors(outResp, corsHeaders);
+            if (shouldStop) return withCors(outResp, corsHeaders);
           }
 
           return withCors(lastResp || jsonResponse(502, jsonError("Upstream error", "bad_gateway")), corsHeaders);

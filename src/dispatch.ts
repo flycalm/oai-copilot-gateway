@@ -1,10 +1,11 @@
-import { joinUrls, jsonError, jsonResponse, normalizeAuthValue, parseUpstreamCustomHeaders } from "./common";
+import { joinUrls, jsonError, jsonResponse, normalizeAuthValue, parseBoolEnv, parseUpstreamCustomHeaders } from "./common";
 import type { Env } from "./common";
 import type { GatewayConfig, ModelConfig, ProviderConfig } from "./config";
 import { handleClaudeChatCompletions } from "./providers/claude";
 import { handleGeminiChatCompletions } from "./providers/gemini";
 import { handleOpenAIChatCompletionsUpstream, handleOpenAIRequest } from "./providers/openai";
 import { listUpstreamCandidates, shouldTryNextUpstreamCandidateStatus } from "./upstreams";
+import { instrumentResponseAndRecordTokens } from "./metrics";
 
 function envWithOverrides(env: Env, overrides: Record<string, string> | null): Env {
   const base = env && typeof env === "object" ? env : {};
@@ -53,6 +54,8 @@ export async function dispatchOpenAIChatToProvider({
   startedAt?: number;
   extraSystemText: string;
 }): Promise<Response> {
+  const metricsEnabled = parseBoolEnv((env as any)?.RSP4COPILOT_TOKEN_STATS_ENABLED) || parseBoolEnv((env as any)?.WEB_UI_ENABLED);
+
   const upstreamCandidates = listUpstreamCandidates({ env, provider, request, reqId });
   if (!upstreamCandidates.length) {
     return jsonResponse(500, jsonError(`Server misconfigured: missing upstream API key for provider ${provider.id}`, "server_error"));
@@ -96,7 +99,7 @@ export async function dispatchOpenAIChatToProvider({
         ...(maxInstructionsChars != null ? { RESP_MAX_INSTRUCTIONS_CHARS: String(maxInstructionsChars) } : null),
       });
 
-      const resp = await handleOpenAIRequest({
+      const resp0 = await handleOpenAIRequest({
         request,
         env: env2,
         reqJson,
@@ -111,9 +114,22 @@ export async function dispatchOpenAIChatToProvider({
         extraSystemText,
       });
 
+      const shouldStop = resp0.ok || !shouldTryNextUpstreamCandidateStatus(resp0.status) || i === upstreamCandidates.length - 1;
+      const resp = metricsEnabled && shouldStop
+        ? await instrumentResponseAndRecordTokens(resp0, {
+            ts: typeof startedAt === "number" && Number.isFinite(startedAt) ? startedAt : Date.now(),
+            reqId,
+            path: typeof path === "string" ? path : "",
+            stream,
+            providerId: provider.id,
+            upstreamId: upstream.id || provider.id,
+            model: model.name || model.upstreamModel,
+          })
+        : resp0;
+
       lastResp = resp;
       if (resp.ok) return resp;
-      if (!shouldTryNextUpstreamCandidateStatus(resp.status) || i === upstreamCandidates.length - 1) return resp;
+      if (shouldStop) return resp;
       continue;
     }
 
@@ -138,7 +154,7 @@ export async function dispatchOpenAIChatToProvider({
         ...(maxInstructionsChars != null ? { RESP_MAX_INSTRUCTIONS_CHARS: String(maxInstructionsChars) } : null),
       });
 
-      const resp = await handleOpenAIChatCompletionsUpstream({
+      const resp0 = await handleOpenAIChatCompletionsUpstream({
         request,
         env: env2,
         reqJson,
@@ -152,9 +168,22 @@ export async function dispatchOpenAIChatToProvider({
         extraSystemText,
       });
 
+      const shouldStop = resp0.ok || !shouldTryNextUpstreamCandidateStatus(resp0.status) || i === upstreamCandidates.length - 1;
+      const resp = metricsEnabled && shouldStop
+        ? await instrumentResponseAndRecordTokens(resp0, {
+            ts: typeof startedAt === "number" && Number.isFinite(startedAt) ? startedAt : Date.now(),
+            reqId,
+            path: typeof path === "string" ? path : "",
+            stream,
+            providerId: provider.id,
+            upstreamId: upstream.id || provider.id,
+            model: model.name || model.upstreamModel,
+          })
+        : resp0;
+
       lastResp = resp;
       if (resp.ok) return resp;
-      if (!shouldTryNextUpstreamCandidateStatus(resp.status) || i === upstreamCandidates.length - 1) return resp;
+      if (shouldStop) return resp;
       continue;
     }
 
@@ -177,7 +206,7 @@ export async function dispatchOpenAIChatToProvider({
         ...(claudeMaxTokens != null ? { CLAUDE_MAX_TOKENS: String(claudeMaxTokens) } : null),
       });
 
-      const resp = await handleClaudeChatCompletions({
+      const resp0 = await handleClaudeChatCompletions({
         request,
         env: env2,
         reqJson,
@@ -188,9 +217,22 @@ export async function dispatchOpenAIChatToProvider({
         extraSystemText,
       });
 
+      const shouldStop = resp0.ok || !shouldTryNextUpstreamCandidateStatus(resp0.status) || i === upstreamCandidates.length - 1;
+      const resp = metricsEnabled && shouldStop
+        ? await instrumentResponseAndRecordTokens(resp0, {
+            ts: typeof startedAt === "number" && Number.isFinite(startedAt) ? startedAt : Date.now(),
+            reqId,
+            path: typeof path === "string" ? path : "",
+            stream,
+            providerId: provider.id,
+            upstreamId: upstream.id || provider.id,
+            model: model.name || model.upstreamModel,
+          })
+        : resp0;
+
       lastResp = resp;
       if (resp.ok) return resp;
-      if (!shouldTryNextUpstreamCandidateStatus(resp.status) || i === upstreamCandidates.length - 1) return resp;
+      if (shouldStop) return resp;
       continue;
     }
 
@@ -201,7 +243,7 @@ export async function dispatchOpenAIChatToProvider({
         ...(upstreamHeadersEnv ? { RSP4COPILOT_UPSTREAM_HEADERS: upstreamHeadersEnv } : null),
       });
 
-      const resp = await handleGeminiChatCompletions({
+      const resp0 = await handleGeminiChatCompletions({
         request,
         env: env2,
         reqJson,
@@ -213,9 +255,22 @@ export async function dispatchOpenAIChatToProvider({
         extraSystemText,
       });
 
+      const shouldStop = resp0.ok || !shouldTryNextUpstreamCandidateStatus(resp0.status) || i === upstreamCandidates.length - 1;
+      const resp = metricsEnabled && shouldStop
+        ? await instrumentResponseAndRecordTokens(resp0, {
+            ts: typeof startedAt === "number" && Number.isFinite(startedAt) ? startedAt : Date.now(),
+            reqId,
+            path: typeof path === "string" ? path : "",
+            stream,
+            providerId: provider.id,
+            upstreamId: upstream.id || provider.id,
+            model: model.name || model.upstreamModel,
+          })
+        : resp0;
+
       lastResp = resp;
       if (resp.ok) return resp;
-      if (!shouldTryNextUpstreamCandidateStatus(resp.status) || i === upstreamCandidates.length - 1) return resp;
+      if (shouldStop) return resp;
       continue;
     }
 
