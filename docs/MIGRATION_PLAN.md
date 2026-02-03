@@ -1,6 +1,6 @@
-# rsp4copilot 网关化改造计划（JS -> TS + 多协议 + 配置驱动路由）
+# oai-copilot-gateway 网关化改造计划（JS -> TS + 多协议 + 配置驱动路由）
 
-> 目标：在**不部署**的前提下，把当前 rsp4copilot 从「仅 OpenAI Chat 入口 + 前缀路由」升级为：
+> 目标：在**不部署**的前提下，把当前 oai-copilot-gateway 从「仅 OpenAI Chat 入口 + 前缀路由」升级为：
 > - 同时暴露：OpenAI Chat、OpenAI Responses、Claude Messages、Gemini generateContent/stream
 > - 路由方式：配置驱动（`model` 支持短 ID 或 `providerId.modelName`）
 > - 保留：现有 WORKER_AUTH_KEY 鉴权、基础 debug 日志能力

@@ -1,8 +1,10 @@
-# rsp4copilot (Cloudflare Worker)
+# oai-copilot-gateway (Cloudflare Worker / Docker)
 
-在 Cloudflare Workers 上运行的 **LLM API 互转 / 路由网关**：同一套后端 provider 配置，同时暴露多种“前端协议”入口，方便 VS Code 等客户端按自己支持的协议接入。
+在 Cloudflare Workers 上运行的 **LLM API 互转 / 路由网关**（也支持 Docker/Node 部署）：同一套后端 provider 配置，同时暴露多种“前端协议”入口，方便 VS Code 等客户端按自己支持的协议接入。
 
 主要用途：让 VS Code 的 [OAI Compatible Provider for Copilot](https://marketplace.visualstudio.com/items?itemName=nicepkg.oai-compatible-copilot) 插件可以使用 OpenAI Responses、Gemini、Claude 等上游（通过中转/Relay）。
+
+> 本项目基于 GitHub 项目 `oai-compatible-copilot` 魔改而来：`https://github.com/JohnnyZ93/oai-compatible-copilot`
 
 友情推广：稳定靠谱codex中转: [rightcode](https://www.right.codes/register?aff=D71E64B0)
 ## 入口协议（多选）

@@ -1,4 +1,4 @@
-# rsp4copilot 公网服务器部署与使用指南（Docker）
+# oai-copilot-gateway 公网服务器部署与使用指南（Docker）
 
 > 说明：本项目核心是一个“多协议 LLM 网关/路由器”，对外提供 OpenAI/Claude/Gemini 兼容接口；对内可接一个或多个第三方中转站（relay）。
 >
@@ -12,7 +12,7 @@
   - 访问：`https://<你的域名>/v1/...`
   - 鉴权：`WORKER_AUTH_KEY`（入口 Key，不是上游 Key）
 - 你的公网服务器
-  - Nginx/Caddy 反代（推荐） → Docker 容器 `rsp4copilot`（默认 `127.0.0.1:8788`）
+  - Nginx/Caddy 反代（推荐） → Docker 容器（compose service 默认名 `rsp4copilot`，默认 `127.0.0.1:8788`）
 - 上游/中转站（可多个）
   - 每个 upstream 配：`baseURL` + `apiKey`（或 `apiKeyEnv` 从环境变量取）
 
@@ -49,8 +49,8 @@ sudo ufw status
 ## 3. 拉取代码
 
 ```bash
-git clone <你的仓库地址> rsp4copilot
-cd rsp4copilot
+git clone <你的仓库地址> oai-copilot-gateway
+cd oai-copilot-gateway
 ```
 
 ---

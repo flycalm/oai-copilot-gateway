@@ -1,5 +1,5 @@
 /**
- * rsp4copilot on Cloudflare Workers
+ * oai-copilot-gateway on Cloudflare Workers
  *
  * Inbound protocols:
  * - OpenAI Chat Completions: `POST /v1/chat/completions`
@@ -234,7 +234,7 @@ function webUiHtml(): string {
 	  <meta charset="utf-8" />
 	  <meta name="viewport" content="width=device-width, initial-scale=1" />
 	  <link rel="icon" href="data:," />
-	  <title>rsp4copilot - API 网关管理界面</title>
+	  <title>oai-copilot-gateway - API 网关管理界面</title>
 	  <style>
     :root {
       color-scheme: light dark;
@@ -670,7 +670,7 @@ function webUiHtml(): string {
     <div class="header-content">
       <div class="logo">
         <div class="logo-icon">🚀</div>
-        <span>rsp4copilot</span>
+        <span>oai-copilot-gateway</span>
       </div>
 	      <nav class="nav-tabs" id="navTabs">
 	        <button class="nav-tab active" data-tab="dashboard">概览</button>
@@ -692,7 +692,7 @@ function webUiHtml(): string {
       <div class="row">
         <div class="col card">
           <h1>🎯 API 网关概览</h1>
-          <p class="muted">这是 rsp4copilot 的管理界面，用于自检和调试网关服务。</p>
+          <p class="muted">这是 oai-copilot-gateway 的管理界面，用于自检和调试网关服务。</p>
           <div class="mt-lg grid">
             <div class="muted">
               <strong>使用提示：</strong><br>
@@ -4400,7 +4400,7 @@ export default {
           const headers: Record<string, string> = {
             "content-type": "text/plain; charset=utf-8",
             "cache-control": "no-store",
-            "www-authenticate": 'Basic realm="rsp4copilot"',
+            "www-authenticate": 'Basic realm="oai-copilot-gateway"',
             "x-content-type-options": "nosniff",
             "x-frame-options": "DENY",
             "referrer-policy": "no-referrer",

@@ -1,4 +1,4 @@
-# rsp4copilot Web UI 使用说明
+# oai-copilot-gateway Web UI 使用说明
 
 本文件解释 Web UI 页面上的各个模块/字段的含义、用途、推荐填写方式与示例（面向 Docker/Node 部署方式）。
 

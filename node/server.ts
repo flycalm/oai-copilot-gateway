@@ -179,7 +179,7 @@ function unauthorizedBasic(): Response {
     headers: {
       "content-type": "text/plain; charset=utf-8",
       "cache-control": "no-store",
-      "www-authenticate": 'Basic realm="rsp4copilot"',
+      "www-authenticate": 'Basic realm="oai-copilot-gateway"',
       "x-content-type-options": "nosniff",
     },
   });
