@@ -2957,8 +2957,99 @@ function webUiHtml(): string {
 
 	        const actionsRow = document.createElement('div');
 	        actionsRow.style.display = 'flex';
+	        actionsRow.style.gap = '10px';
 	        actionsRow.style.justifyContent = 'flex-end';
 	        actionsRow.style.marginBottom = '12px';
+
+	        const renameBtn = document.createElement('button');
+	        renameBtn.textContent = '✏️ 编辑名称';
+	        renameBtn.style.padding = '6px 12px';
+	        renameBtn.style.fontSize = '13px';
+	        renameBtn.addEventListener('click', async (e) => {
+	          e.preventDefault();
+	          e.stopPropagation();
+
+	          const root2 = normalizeCfgObjForUi(ensureCfgObj());
+	          const providers2 = root2 && root2.providers && typeof root2.providers === 'object' ? root2.providers : {};
+	          if (!providers2 || !providers2[pid]) { alert('provider 不存在：' + pid); return; }
+
+	          const newId0 = await promptTextModal({
+	            title: '重命名 Provider',
+	            label: '新的 provider id（不能包含点号；建议只用字母/数字/_/-）',
+	            placeholder: '例如 openai2 / relay-a / claude',
+	            initialValue: pid,
+	            okText: '重命名',
+	            cancelText: '取消',
+	          });
+	          const newId = safeStr(newId0).trim();
+	          if (!newId) return;
+	          if (newId === pid) return;
+	          if (newId.includes('.')) { alert('provider id 不能包含 .'); return; }
+	          if (!/^[A-Za-z0-9_-]+$/.test(newId)) { alert('provider id 建议只用字母/数字/_/-'); return; }
+	          if (providers2[newId]) { alert('已存在同名 provider：' + newId); return; }
+
+	          const warnLines = [
+	            '将把 provider 从 ' + pid + ' 重命名为 ' + newId + '。',
+	            '影响：',
+	            '- 完整模型 ID（providerId.modelName）会变化（如果你的客户端使用了完整 ID，需要同步改配置）。',
+	            '- v2 routes 里引用到该 provider 的绑定会自动更新。',
+	          ];
+	          if (!confirm(warnLines.join('\\n'))) return;
+
+	          const p2 = providers2[pid] || {};
+	          try { p2.id = newId; } catch {}
+	          providers2[newId] = p2;
+	          delete providers2[pid];
+	          root2.providers = providers2;
+
+	          // Preserve expand/collapse state
+	          try {
+	            cfgFormOpenState.providers[newId] = Boolean(cfgFormOpenState.providers[pid]);
+	            delete cfgFormOpenState.providers[pid];
+	          } catch {}
+
+	          // v1 model details open state key: pid::modelName
+	          try {
+	            const next = Object.create(null);
+	            const prefix = pid + '::';
+	            for (const [k, v] of Object.entries(cfgFormOpenState.v1Models || {})) {
+	              if (String(k).startsWith(prefix)) {
+	                next[newId + '::' + String(k).slice(prefix.length)] = Boolean(v);
+	              } else {
+	                next[k] = Boolean(v);
+	              }
+	            }
+	            cfgFormOpenState.v1Models = next;
+	          } catch {}
+
+	          // Update v2 route bindings
+	          try {
+	            if (Number(root2 && root2.version) === 2 && root2.routes && typeof root2.routes === 'object') {
+	              for (const r of Object.values(root2.routes || {})) {
+	                if (!r || typeof r !== 'object') continue;
+	                const list = Array.isArray(r.providers) ? r.providers : [];
+	                for (let i = 0; i < list.length; i++) {
+	                  const it = list[i];
+	                  if (typeof it === 'string') {
+	                    if (it === pid) list[i] = newId;
+	                    continue;
+	                  }
+	                  if (it && typeof it === 'object') {
+	                    const o = it;
+	                    if (safeStr(o.providerId || '').trim() === pid) o.providerId = newId;
+	                    if (safeStr(o.id || '').trim() === pid) o.id = newId; // legacy alias
+	                    list[i] = o;
+	                  }
+	                }
+	                r.providers = list;
+	              }
+	            }
+	          } catch {}
+
+	          cfgObj = root2;
+	          renderProvidersForm();
+	        });
+	        actionsRow.appendChild(renameBtn);
 
 	        const delBtn = document.createElement('button');
 	        delBtn.className = 'danger';
