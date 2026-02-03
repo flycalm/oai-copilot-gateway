@@ -8,11 +8,9 @@
 
       // 自动从上游拉取 GET /v1/models（或兼容的 /models），用于免手写模型名/前端下拉框
       "discoverModels": true,
-      "discoverModelsTtlSeconds": 300,
 
       // 可选：需要“改名/加默认 options”时再显式写 models 映射
       "models": {}
     }
   }
 }
-

@@ -35,7 +35,6 @@ export interface ProviderConfig {
   endpoints: Record<string, unknown>;
   quirks: Record<string, unknown>;
   discoverModels?: boolean;
-  discoverModelsTtlSeconds?: number;
   models: Record<string, ModelConfig>;
 }
 
@@ -93,14 +92,6 @@ function normalizeBoolLike(raw: unknown): boolean {
   if (!v0) return false;
   const v = v0.toLowerCase();
   return v === "1" || v === "true" || v === "yes" || v === "y" || v === "on";
-}
-
-function normalizeDiscoverModelsTtlSeconds(raw: unknown): number | undefined {
-  if (raw == null || raw === "") return undefined;
-  const n = typeof raw === "number" ? raw : Number(String(raw ?? ""));
-  if (!Number.isFinite(n)) return undefined;
-  if (n <= 0) return undefined;
-  return Math.min(24 * 3600, Math.floor(n));
 }
 
 function inferProviderOwnedBy(apiMode: string, providerId: string): string {
@@ -171,9 +162,6 @@ function normalizeProviderConfig(id: string, raw: unknown): ProviderConfig {
   const discoverModels = normalizeBoolLike(
     (obj as any).discoverModels ?? (obj as any).autoModels ?? (obj as any).modelsFromUpstream ?? (obj as any).discover_models,
   );
-  const discoverModelsTtlSeconds = normalizeDiscoverModelsTtlSeconds(
-    (obj as any).discoverModelsTtlSeconds ?? (obj as any).modelsTtlSeconds ?? (obj as any).modelsCacheTtlSeconds ?? (obj as any).discover_models_ttl_seconds,
-  );
 
   return {
     id,
@@ -189,7 +177,6 @@ function normalizeProviderConfig(id: string, raw: unknown): ProviderConfig {
     endpoints,
     quirks,
     discoverModels,
-    discoverModelsTtlSeconds,
     models: models as unknown as Record<string, ModelConfig>,
   };
 }

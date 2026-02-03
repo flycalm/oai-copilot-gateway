@@ -69,9 +69,8 @@
       "apiMode": "openai-responses",
       "baseURL": "https://your-relay.example/openai",
       "apiKey": "REPLACE_ME",
-      // 可选：自动从上游拉取 GET /v1/models，并缓存一段时间（用于前端下拉框/免手写模型名）
+      // 可选：自动从上游拉取 GET /v1/models（用于前端下拉框/免手写模型名）
       "discoverModels": true,
-      "discoverModelsTtlSeconds": 300,
       "quirks": {
         "noInstructions": false,
         "noPreviousResponseId": false

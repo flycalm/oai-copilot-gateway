@@ -2,7 +2,6 @@ import type { Env } from "./common";
 import { applyUpstreamCustomHeaders, joinPathPrefix, logDebug, normalizeBaseUrl } from "./common";
 import type { GatewayConfig, ProviderConfig } from "./config";
 import { listUpstreamCandidates } from "./upstreams";
-import { getDiscoveredModelsCacheEntry, setDiscoveredModelsCache } from "./models_discovery_cache";
 
 function normalizeDuplicateV1Segments(path: unknown): string {
   let p = typeof path === "string" ? path : path == null ? "" : String(path);
@@ -101,13 +100,6 @@ function parseOpenAIModelsList(json: unknown): string[] {
   return out;
 }
 
-function normalizeDiscoverTtlSeconds(raw: unknown): number {
-  const n = typeof raw === "number" ? raw : Number(String(raw ?? ""));
-  if (!Number.isFinite(n)) return 300;
-  if (n <= 0) return 300;
-  return Math.min(24 * 3600, Math.floor(n));
-}
-
 function shouldDiscoverModels(provider: ProviderConfig): boolean {
   return Boolean((provider as any)?.discoverModels);
 }
@@ -196,17 +188,7 @@ export async function refreshDiscoveredModelsForConfig({
   const tasks = providers
     .filter((p) => p && shouldDiscoverModels(p))
     .map(async (provider) => {
-      const cached = getDiscoveredModelsCacheEntry(provider.id);
-      const ttlSeconds = normalizeDiscoverTtlSeconds((provider as any)?.discoverModelsTtlSeconds);
-
-      const modelNames = cached
-        ? Array.from(cached.models).sort((a, b) => a.localeCompare(b))
-        : await fetchModelsFromUpstream({ env, provider, request, reqId, debug });
-
-      if (!cached) {
-        const effectiveTtl = modelNames.length ? ttlSeconds : Math.min(ttlSeconds, 30);
-        setDiscoveredModelsCache(provider.id, modelNames, effectiveTtl);
-      }
+      const modelNames = await fetchModelsFromUpstream({ env, provider, request, reqId, debug });
       const ownedBy = typeof provider?.ownedBy === "string" && provider.ownedBy.trim() ? provider.ownedBy.trim() : provider.id;
       return modelNames.map((modelName) => ({ providerId: provider.id, modelName, ownedBy }));
     });

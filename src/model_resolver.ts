@@ -1,6 +1,5 @@
 import { jsonError } from "./common";
 import type { GatewayConfig, ModelConfig, ProviderConfig } from "./config";
-import { findProvidersForDiscoveredModel, hasDiscoveredModel } from "./models_discovery_cache";
 
 function buildDynamicModelConfig(modelName: string): ModelConfig {
   const name = String(modelName || "").trim();
@@ -111,24 +110,6 @@ export function resolveModel(
   }
 
   if (!matches.length) {
-    const discoveredProviders = findProvidersForDiscoveredModel(modelName).filter((pid) => {
-      const p = config.providers?.[pid];
-      return Boolean(p && (p as any)?.discoverModels && hasDiscoveredModel(pid, modelName));
-    });
-
-    if (discoveredProviders.length === 1) {
-      const providerId = discoveredProviders[0];
-      const provider = config.providers[providerId];
-      return { ok: true, providerId, modelName, provider, model: buildDynamicModelConfig(modelName) };
-    }
-    if (discoveredProviders.length > 1) {
-      return {
-        ok: false,
-        status: 400,
-        error: jsonError(`Ambiguous model: ${modelName} (provide 'provider' or use providerId.modelName)`, "invalid_request_error"),
-      };
-    }
-
     const dynamicProviders = Object.entries(config.providers)
       .filter(([, p]) => Boolean((p as any)?.discoverModels))
       .map(([pid]) => pid);

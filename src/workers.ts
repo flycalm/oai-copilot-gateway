@@ -1766,26 +1766,10 @@ function webUiHtml(): string {
 	        discoverRow.appendChild(discover);
 	        const discoverHint = document.createElement('div');
 	        discoverHint.className = 'muted';
-	        discoverHint.textContent = '开启后会尝试调用上游 GET /v1/models（或 /models）并缓存，用于免手写模型名/前端下拉框。';
+	        discoverHint.textContent = '开启后会尝试调用上游 GET /v1/models（或 /models），用于免手写模型名/前端下拉框。';
 	        discoverRow.appendChild(discoverHint);
 	        discoverWrap.appendChild(discoverRow);
 	        grid.appendChild(discoverWrap);
-
-	        const ttlWrap = document.createElement('div');
-	        const ttlLabel = document.createElement('label');
-	        ttlLabel.textContent = 'discoverModelsTtlSeconds（缓存秒数）';
-	        ttlWrap.appendChild(ttlLabel);
-	        const ttlIn = document.createElement('input');
-	        ttlIn.placeholder = '例如 300';
-	        ttlIn.value = safeStr(p.discoverModelsTtlSeconds == null ? '' : p.discoverModelsTtlSeconds);
-	        ttlIn.addEventListener('input', () => {
-	          const n = Number(ttlIn.value);
-	          if (Number.isFinite(n) && n > 0) p.discoverModelsTtlSeconds = Math.floor(n);
-	          else delete p.discoverModelsTtlSeconds;
-	          providers[pid] = p;
-	        });
-	        ttlWrap.appendChild(ttlIn);
-	        grid.appendChild(ttlWrap);
 
 	        const upstreams = Array.isArray(p.upstreams) ? p.upstreams : [];
 	        const useUpsWrap = document.createElement('div');

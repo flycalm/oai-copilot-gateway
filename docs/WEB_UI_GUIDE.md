@@ -54,7 +54,7 @@ Web UI 使用 **HTTP Basic Auth**（浏览器会弹出登录框）：
 
 默认情况下，这个列表来自你的 `RSP4COPILOT_CONFIG`（即你映射后的“对外模型名”）。
 
-如果你在某个 provider 上开启了 `discoverModels: true`，网关会尝试调用该 provider 的上游 `GET /v1/models`（或兼容的 `/models`）来自动补全模型列表，并在内存中按 `discoverModelsTtlSeconds` 做缓存。
+如果你在某个 provider 上开启了 `discoverModels: true`，网关会尝试调用该 provider 的上游 `GET /v1/models`（或兼容的 `/models`）来自动补全模型列表。
 
 ---
 
