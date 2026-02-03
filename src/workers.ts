@@ -1622,14 +1622,49 @@ function webUiHtml(): string {
 	    }
 
 		    function ensureCfgObj(){
-		      if (!cfgObj || typeof cfgObj !== 'object') cfgObj = { version: 1, providers: {} };
+		      if (!cfgObj || typeof cfgObj !== 'object') cfgObj = { version: 2, providers: {}, models: {}, routes: {} };
 		      if (!cfgObj.providers || typeof cfgObj.providers !== 'object') cfgObj.providers = {};
-		      if (!cfgObj.version) cfgObj.version = 1;
+		      const v = Number(cfgObj.version || 2);
+		      cfgObj.version = (v === 1 ? 1 : 2);
 		      if (Number(cfgObj.version) === 2) {
 		        if (!cfgObj.models || typeof cfgObj.models !== 'object') cfgObj.models = {};
 		        if (!cfgObj.routes || typeof cfgObj.routes !== 'object') cfgObj.routes = {};
 		      }
 		      return cfgObj;
+		    }
+
+		    function migrateV1ToV2IfNeeded(root){
+		      if (!root || typeof root !== 'object') return false;
+		      const v = Number(root.version ?? 1);
+		      if (v !== 1) return false;
+
+		      // Convert provider.models -> root.models + root.routes, then clear provider.models.
+		      root.version = 2;
+		      if (!root.models || typeof root.models !== 'object') root.models = {};
+		      if (!root.routes || typeof root.routes !== 'object') root.routes = {};
+		      if (!root.providers || typeof root.providers !== 'object') root.providers = {};
+
+		      for (const pid of Object.keys(root.providers || {})) {
+		        const p = (root.providers[pid] && typeof root.providers[pid] === 'object') ? root.providers[pid] : {};
+		        const pm = (p.models && typeof p.models === 'object') ? p.models : {};
+		        for (const mn of Object.keys(pm)) {
+		          const m0 = pm[mn] || {};
+		          const modelName = safeStr(mn).trim();
+		          if (!modelName) continue;
+		          if (modelName.includes(':')) continue;
+		          if (!root.models[modelName]) root.models[modelName] = { upstreamModel: modelName, options: {}, quirks: {} };
+		          if (!root.routes[modelName] || typeof root.routes[modelName] !== 'object') root.routes[modelName] = { strategy: 'priority', providers: [] };
+		          const route = root.routes[modelName];
+		          if (!Array.isArray(route.providers)) route.providers = [];
+		          if (!route.strategy) route.strategy = 'priority';
+		          if (route.providers.some((x) => x && typeof x === 'object' && safeStr(x.providerId).trim() === pid)) continue;
+		          route.providers.push({ providerId: pid, upstreamModel: safeStr(m0.upstreamModel || modelName).trim() || modelName });
+		        }
+		        p.models = {};
+		        root.providers[pid] = p;
+		      }
+
+		      return true;
 		    }
 
 		    function safeStr(v){ return String(v == null ? '' : v); }
@@ -2363,7 +2398,14 @@ function webUiHtml(): string {
 		      if (!providersFormEl) return;
 		      const root = normalizeCfgObjForUi(ensureCfgObj());
 		      providersFormEl.innerHTML = '';
-		      const isV2 = Number(root && root.version) === 2;
+		      let isV2 = Number(root && root.version) === 2;
+		      if (!isV2) {
+		        const migrated = migrateV1ToV2IfNeeded(root);
+		        if (migrated) {
+		          cfgObj = root;
+		          isV2 = true;
+		        }
+		      }
 		      const providers = root.providers && typeof root.providers === 'object' ? root.providers : {};
 		      const apiKeyEnvDefaults = [
 		        'OPENAI_API_KEY',
@@ -2375,52 +2417,17 @@ function webUiHtml(): string {
 		      const apiKeyEnvChoicesForUi = mergeStringLists(apiKeyEnvDefaults, mergeStringLists(collectApiKeyEnvChoicesFromConfig(root), apiKeyEnvChoiceState.list));
 		      const ids = Object.keys(providers).sort();
 
-		      if (!isV2) {
-		        const notice = document.createElement('div');
-		        notice.className = 'card';
-		        notice.style.marginBottom = '16px';
-		        notice.style.display = 'grid';
-		        notice.style.gap = '10px';
-		        const title = document.createElement('div');
-		        title.style.fontWeight = '800';
-		        title.textContent = '🧩 配置模式：v1（provider 内绑定 models）';
-		        const desc = document.createElement('div');
-		        desc.className = 'muted';
-		        desc.textContent = '如需“模型/供应商解绑（模型可绑定多个 provider，按策略自动路由）”，可升级到 v2。';
-		        const btn = document.createElement('button');
-		        btn.className = 'primary';
-		        btn.textContent = '升级到 v2（模型/供应商解绑）';
-		        btn.addEventListener('click', (e) => {
-		          e.preventDefault();
-		          if (!confirm('确认把配置升级到 v2？（会把 provider.models 转换为 root.models + root.routes，并清空 provider.models）')) return;
-		          root.version = 2;
-		          if (!root.models || typeof root.models !== 'object') root.models = {};
-		          if (!root.routes || typeof root.routes !== 'object') root.routes = {};
-		          for (const pid of Object.keys(root.providers || {})) {
-		            const p = (root.providers[pid] && typeof root.providers[pid] === 'object') ? root.providers[pid] : {};
-		            const pm = (p.models && typeof p.models === 'object') ? p.models : {};
-		            for (const mn of Object.keys(pm)) {
-		              const m0 = pm[mn] || {};
-		              const modelName = safeStr(mn).trim();
-		              if (!modelName) continue;
-		              if (!root.models[modelName]) root.models[modelName] = { upstreamModel: modelName, options: {}, quirks: {} };
-		              if (!root.routes[modelName] || typeof root.routes[modelName] !== 'object') root.routes[modelName] = { strategy: 'priority', providers: [] };
-		              const route = root.routes[modelName];
-		              if (!Array.isArray(route.providers)) route.providers = [];
-		              if (route.providers.some((x) => x && typeof x === 'object' && safeStr(x.providerId).trim() === pid)) continue;
-		              route.providers.push({ providerId: pid, upstreamModel: safeStr(m0.upstreamModel || modelName).trim() || modelName });
-		            }
-		            p.models = {};
-		            root.providers[pid] = p;
-		          }
-		          cfgObj = root;
-		          renderProvidersForm();
-		        });
-		        notice.appendChild(title);
-		        notice.appendChild(desc);
-		        notice.appendChild(btn);
-		        providersFormEl.appendChild(notice);
-		      }
+		      const columns = document.createElement('div');
+		      columns.style.display = 'grid';
+		      columns.style.gap = '16px';
+		      columns.style.alignItems = 'start';
+		      columns.style.gridTemplateColumns = 'repeat(auto-fit, minmax(520px, 1fr))';
+
+		      const providersPanel = document.createElement('div');
+		      const modelsPanel = document.createElement('div');
+		      columns.appendChild(providersPanel);
+		      columns.appendChild(modelsPanel);
+		      providersFormEl.appendChild(columns);
 
 		      if (!ids.length) {
 		        const empty = document.createElement('div');
@@ -2428,8 +2435,7 @@ function webUiHtml(): string {
 	        empty.style.textAlign = 'center';
 	        empty.style.padding = '32px';
 	        empty.innerHTML = '<div style="font-size:48px; margin-bottom:12px">📦</div><div>尚未配置任何 provider</div><div style="margin-top:8px">点击上方"添加 Provider"开始配置</div>';
-	        providersFormEl.appendChild(empty);
-	        if (!isV2) return;
+	        providersPanel.appendChild(empty);
 	      }
 
 	      for (const pid of ids) {
@@ -2797,7 +2803,7 @@ function webUiHtml(): string {
 	        }
 
 	        card.appendChild(grid);
-	        providersFormEl.appendChild(card);
+	        providersPanel.appendChild(card);
 	      }
 
 	      if (isV2) {
@@ -3103,7 +3109,7 @@ function webUiHtml(): string {
 	        }
 
 	        modelsCard.appendChild(list);
-	        providersFormEl.appendChild(modelsCard);
+	        modelsPanel.appendChild(modelsCard);
 	      }
 	    }
 
@@ -3139,12 +3145,19 @@ function webUiHtml(): string {
 	        if (!cfgObj) {
 	          try { cfgObj = JSON.parse(cfgEl.value || '{}'); } catch {}
 	        }
+		        let migrated = false;
 		        if (cfgObj) {
+		          migrated = migrateV1ToV2IfNeeded(cfgObj);
 		          normalizeCfgObjForUi(cfgObj);
 		          renderProvidersForm();
 		          loadApiKeyEnvChoicesFromServer().then(() => { try { if (cfgObj) renderProvidersForm(); } catch {} });
 		        }
-		        setCfgStatus('已加载。文件存在=' + (exists ? 'true' : 'false') + '；写入权限(开关)=' + (writable ? 'true' : 'false') + (parsed && parsed.ok === false ? '；解析错误：' + parsed.error : ''));
+		        setCfgStatus(
+		          '已加载。文件存在=' + (exists ? 'true' : 'false') +
+		          '；写入权限(开关)=' + (writable ? 'true' : 'false') +
+		          (migrated ? '；已自动升级到 v2（未保存）' : '') +
+		          (parsed && parsed.ok === false ? '；解析错误：' + parsed.error : '')
+		        );
 		      } catch (e) {
 		        setCfgStatus('加载异常：' + String(e && e.message ? e.message : e));
 		      }
@@ -3188,10 +3201,11 @@ function webUiHtml(): string {
 	          }
 	        }
 		        if (!cfgObj) { setCfgStatus('没有可视化数据：请先点击“加载配置”。'); return; }
+		        const migrated = migrateV1ToV2IfNeeded(cfgObj);
 		        normalizeCfgObjForUi(cfgObj);
 		        renderProvidersForm();
 		        loadApiKeyEnvChoicesFromServer().then(() => { try { if (cfgObj) renderProvidersForm(); } catch {} });
-		        setCfgStatus('可视化已刷新。');
+		        setCfgStatus('可视化已刷新。' + (migrated ? '；已自动升级到 v2（未保存）' : ''));
 		      } catch (e) {
 		        setCfgStatus('刷新异常：' + String(e && e.message ? e.message : e));
 		      }
