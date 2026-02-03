@@ -31,6 +31,12 @@ export type TokenMetricAgg = {
   cachedTokens: number;
 };
 
+export type TokenMetricsPersistedStateV1 = {
+  v: 1;
+  recent: TokenMetricRecord[];
+  daily: Record<string, Record<string, TokenMetricAgg>>;
+};
+
 function dateKeyUtc(ts: number): string {
   try {
     return new Date(ts).toISOString().slice(0, 10);
@@ -424,6 +430,50 @@ export class TokenMetricsStore {
 
     return { from, to, totals, groups, days: byDay };
   }
+
+  exportState(): TokenMetricsPersistedStateV1 {
+    const daily: Record<string, Record<string, TokenMetricAgg>> = {};
+    for (const [date, m] of this.dailyByUpstream.entries()) {
+      const obj: Record<string, TokenMetricAgg> = {};
+      for (const [k, a] of m.entries()) obj[k] = a;
+      daily[date] = obj;
+    }
+    return { v: 1, recent: this.recent.slice(0, this.maxRecent), daily };
+  }
+
+  importState(state: unknown): void {
+    const s = state && typeof state === "object" ? (state as any) : null;
+    if (!s || Number(s.v) !== 1) return;
+
+    const nextRecent: TokenMetricRecord[] = Array.isArray(s.recent) ? (s.recent as any[]).filter((x) => x && typeof x === "object") : [];
+    this.recent = nextRecent.slice(0, this.maxRecent) as any;
+
+    const dailyRaw = s.daily && typeof s.daily === "object" ? (s.daily as any) : null;
+    const nextDaily = new Map<string, Map<string, TokenMetricAgg>>();
+    if (dailyRaw) {
+      for (const [date, v] of Object.entries(dailyRaw)) {
+        if (typeof date !== "string" || !date) continue;
+        const dayObj = v && typeof v === "object" ? (v as any) : null;
+        if (!dayObj) continue;
+        const mm = new Map<string, TokenMetricAgg>();
+        for (const [k, a] of Object.entries(dayObj)) {
+          if (typeof k !== "string" || !k) continue;
+          const aa = a && typeof a === "object" ? (a as any) : null;
+          if (!aa) continue;
+          mm.set(k, {
+            requests: Number.isFinite(Number(aa.requests)) ? Math.max(0, Math.floor(Number(aa.requests))) : 0,
+            promptTokens: Number.isFinite(Number(aa.promptTokens)) ? Math.max(0, Math.floor(Number(aa.promptTokens))) : 0,
+            completionTokens: Number.isFinite(Number(aa.completionTokens)) ? Math.max(0, Math.floor(Number(aa.completionTokens))) : 0,
+            totalTokens: Number.isFinite(Number(aa.totalTokens)) ? Math.max(0, Math.floor(Number(aa.totalTokens))) : 0,
+            cachedTokens: Number.isFinite(Number(aa.cachedTokens)) ? Math.max(0, Math.floor(Number(aa.cachedTokens))) : 0,
+          });
+        }
+        if (mm.size) nextDaily.set(date, mm);
+      }
+    }
+    this.dailyByUpstream = nextDaily;
+    this.prune();
+  }
 }
 
 export const tokenMetrics = new TokenMetricsStore();
@@ -434,7 +484,11 @@ export function tokenMetricsErrorResponse(message: string, code = "not_found"): 
 
 export async function instrumentResponseAndRecordTokens(
   resp: Response,
-  ctx: Omit<TokenMetricRecord, "status" | "usage" | "usageSource"> & { status?: TokenMetricStatus; estimatedPromptTokens?: number },
+  ctx: Omit<TokenMetricRecord, "status" | "usage" | "usageSource"> & {
+    status?: TokenMetricStatus;
+    estimatedPromptTokens?: number;
+    onMetricRecorded?: () => void;
+  },
 ): Promise<Response> {
   const base: Omit<TokenMetricRecord, "status"> = {
     ts: ctx.ts,
@@ -481,6 +535,9 @@ export async function instrumentResponseAndRecordTokens(
       ...(usage ? { usage } : {}),
       ...(usageSource ? { usageSource } : {}),
     });
+    try {
+      ctx.onMetricRecorded?.();
+    } catch {}
     return resp;
   }
 
@@ -557,6 +614,9 @@ export async function instrumentResponseAndRecordTokens(
           ...(usage ? { usage } : {}),
           ...(usageSource ? { usageSource } : {}),
         });
+        try {
+          ctx.onMetricRecorded?.();
+        } catch {}
       }
     })();
 
@@ -578,6 +638,9 @@ export async function instrumentResponseAndRecordTokens(
     latencyMs: Math.max(0, Date.now() - startedAt),
     ...(usage ? { usage, usageSource: "estimate" } : {}),
   });
+  try {
+    ctx.onMetricRecorded?.();
+  } catch {}
   return resp;
 }
 

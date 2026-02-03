@@ -42,7 +42,7 @@
 - IP 白名单：设置 `WORKER_ALLOWED_IPS`（逗号分隔；支持 IPv4 CIDR，如 `10.0.0.0/8`），只有来自白名单的请求才会被处理。
 - 若在反代后面取真实客户端 IP：再设置 `WORKER_TRUST_PROXY_HEADERS=true`，将使用 `X-Forwarded-For` / `X-Real-IP` 等头部解析来源 IP。
 - 内置 Web UI：设置 `WEB_UI_ENABLED=true`，并配置 `WEB_UI_BASIC_USER`/`WEB_UI_BASIC_PASS`（HTTP Basic Auth），访问 `GET /`（或 `/ui`）即可打开一个简单的自检/调试页面。
-- Web UI 上游可用率统计：在“可用率”页查看按 `provider/upstream` + `model` 聚合的成功率/趋势（内存统计；重启清空；随 `WEB_UI_ENABLED` 或 `RSP4COPILOT_TOKEN_STATS_ENABLED` 启用）。
+- Web UI 上游可用率统计：在“可用率”页查看按 `provider/upstream` + `model` 聚合的成功率/趋势（默认内存；Node/Docker 默认落盘到 `RSP4COPILOT_STATS_FILE`；Worker 可绑定 `RSP4COPILOT_STATS_KV`；随 `WEB_UI_ENABLED` 或 `RSP4COPILOT_TOKEN_STATS_ENABLED` 启用）。
 - Web UI 免填入口 Key（Docker/Node）：页面会优先通过 `/ui/api/*` 由服务端代发网关请求并自动注入 `WORKER_AUTH_KEY`；只有在未检测到该代理时，才需要在页面里手动填入口 Key。
 - Web UI 在线编辑配置文件（Docker）：设置 `WEB_UI_CONFIG_WRITE=true` 后，可在页面里通过 `/admin/api/config` 读取/保存 `RSP4COPILOT_CONFIG_FILE`（强烈建议仅在内网/反代鉴权后使用）。
 - Web UI 查看密钥（Docker）：设置 `WEB_UI_SECRETS_VIEW=true` 后，可在页面里通过 `/admin/api/secrets` 查看上游/下游 key（默认脱敏；若要明文再设 `WEB_UI_SECRETS_REVEAL=true`；强烈建议仅在内网/反代鉴权后使用）。

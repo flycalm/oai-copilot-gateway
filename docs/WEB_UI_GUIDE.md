@@ -74,7 +74,11 @@ Web UI 使用 **HTTP Basic Auth**（浏览器会弹出登录框）：
 - `GET /v1/metrics/tokens/overview?days=30&groupBy=upstream`
 - `GET /v1/metrics/tokens/recent?since=0&limit=200`
 
-> 说明：当前实现为内存统计，服务重启会清空历史数据。
+> 说明：默认内存统计；如开启持久化则重启不会清空。
+
+持久化方式：
+- Docker/Node（默认开启）：写入 `RSP4COPILOT_STATS_FILE`（默认 `/config/rsp4copilot.stats.json`），可用 `RSP4COPILOT_STATS_PERSIST=false` 关闭。
+- Cloudflare Worker：绑定 KV Namespace 为 `RSP4COPILOT_STATS_KV`（可选：`RSP4COPILOT_STATS_KEY` 自定义存储 key）。
 
 ## 1.1.2 上游可用率（/v1/metrics/availability/*）
 
@@ -91,7 +95,7 @@ Web UI 使用 **HTTP Basic Auth**（浏览器会弹出登录框）：
 - `GET /v1/metrics/availability/overview?days=30&groupBy=upstream_model`
 - `GET /v1/metrics/availability/recent?since=0&limit=200`
 
-> 说明：当前实现为内存统计，服务重启会清空历史数据。
+> 说明：默认内存统计；如开启持久化则重启不会清空（配置同上）。
 
 ## 1.2 服务端配置文件（Docker）
 

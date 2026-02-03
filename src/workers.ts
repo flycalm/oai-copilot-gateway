@@ -44,6 +44,7 @@ import { openAIChatSseToGeminiSse, openAIChatSseToResponsesSse } from "./protoco
 import { listUpstreamCandidates, shouldTryNextUpstreamCandidateStatus } from "./upstreams";
 import { instrumentResponseAndRecordTokens, tokenEstimates, tokenMetrics, tokenMetricsErrorResponse } from "./metrics";
 import { availabilityMetrics, availabilityMetricsErrorResponse } from "./availability";
+import { ensureStatsLoaded, flushStatsIfNeeded, markStatsDirty } from "./stats_persist";
 
 function getCorsHeaders(request: Request): Record<string, string> {
   const origin = request.headers.get("origin") || "";
@@ -394,6 +395,98 @@ function webUiHtml(): string {
       border-color:var(--border-light);
       box-shadow:var(--shadow-lg);
     }
+
+    /* Collapsible (Config UI) */
+    details.cfg-details{ padding:0; }
+    details.cfg-details > summary{
+      list-style:none;
+      cursor:pointer;
+      padding:20px;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+      user-select:none;
+    }
+    details.cfg-details > summary::-webkit-details-marker{ display:none; }
+    details.cfg-details[open] > summary{
+      border-bottom:1px solid var(--border);
+      padding-bottom:12px;
+      margin-bottom:16px;
+    }
+    details.cfg-details > .cfg-details-body{ padding:0 20px 20px 20px; }
+
+    .cfg-summary-left{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      min-width:0;
+    }
+    .cfg-caret{
+      font-size:12px;
+      color:var(--muted);
+      transition:transform 0.15s ease;
+    }
+    details[open] > summary .cfg-caret{ transform:rotate(90deg); }
+    .cfg-summary-title{
+      font-weight:700;
+      font-size:16px;
+      min-width:0;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    .cfg-summary-meta{
+      color:var(--muted);
+      font-size:12px;
+      min-width:0;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+    }
+    summary:focus-visible{
+      outline:2px solid color-mix(in oklab, var(--accent) 70%, transparent);
+      outline-offset:2px;
+      border-radius:10px;
+    }
+
+    details.cfg-item{
+      padding:0;
+      border:1px solid var(--border);
+      border-radius:10px;
+      background:var(--bg);
+    }
+    details.cfg-item > summary{
+      list-style:none;
+      cursor:pointer;
+      padding:12px;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      user-select:none;
+    }
+    details.cfg-item > summary::-webkit-details-marker{ display:none; }
+    details.cfg-item[open] > summary{
+      border-bottom:1px solid var(--border);
+      padding-bottom:8px;
+      margin-bottom:10px;
+    }
+    details.cfg-item > .cfg-item-body{
+      padding:0 12px 12px 12px;
+      display:grid;
+      gap:10px;
+    }
+    details.cfg-item summary .cfg-summary-title{
+      font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size:13px;
+      font-weight:600;
+      color:var(--accent-light);
+    }
+    details.cfg-item summary .cfg-summary-meta{
+      color:var(--muted);
+      font-size:12px;
+    }
     h1, h2, h3{ margin:0 0 12px; }
     h1{ font-size:22px; font-weight:700; }
     h2{ font-size:16px; font-weight:600; color:var(--text); }
@@ -630,7 +723,7 @@ function webUiHtml(): string {
         <h1>🧮 Token 统计</h1>
         <p class="muted">
           实时统计每次调用的 Token、每日用量趋势，并支持按上游分组查看。<br>
-          <strong>提示：</strong>当前实现为内存统计（重启服务会清空）；通过 <code>WEB_UI_ENABLED=true</code> 或 <code>RSP4COPILOT_TOKEN_STATS_ENABLED=true</code> 启用。
+          <strong>提示：</strong>默认内存统计；若开启持久化（Node/Docker 默认开启，或 Cloudflare Worker 绑定 KV）则重启不会丢失。通过 <code>WEB_UI_ENABLED=true</code> 或 <code>RSP4COPILOT_TOKEN_STATS_ENABLED=true</code> 启用。
         </p>
 
         <div class="mt-lg grid">
@@ -736,7 +829,7 @@ function webUiHtml(): string {
         <h1>✅ 上游可用率</h1>
         <p class="muted">
           统计上游调用的成功率（按 <code>provider/upstream</code> 与 <code>model</code> 聚合），并展示趋势与最近请求。<br>
-          <strong>提示：</strong>当前实现为内存统计（重启服务会清空）；通过 <code>WEB_UI_ENABLED=true</code> 或 <code>RSP4COPILOT_TOKEN_STATS_ENABLED=true</code> 启用。
+          <strong>提示：</strong>默认内存统计；若开启持久化（Node/Docker 默认开启，或 Cloudflare Worker 绑定 KV）则重启不会丢失。通过 <code>WEB_UI_ENABLED=true</code> 或 <code>RSP4COPILOT_TOKEN_STATS_ENABLED=true</code> 启用。
         </p>
 
         <div class="mt-lg grid">
@@ -1983,6 +2076,12 @@ function webUiHtml(): string {
 
 	    let cfgObj = null;
 
+	    const cfgFormOpenState = {
+	      providers: Object.create(null),
+	      v1Models: Object.create(null),
+	      v2Models: Object.create(null),
+	    };
+
 	    function setTestStatus(text){
 	      testStatusEl.textContent = text || '';
 	    }
@@ -2806,28 +2905,64 @@ function webUiHtml(): string {
 
 	      for (const pid of ids) {
 	        const p = providers[pid] || {};
-	        const card = document.createElement('div');
-	        card.className = 'card';
+	        const card = document.createElement('details');
+	        card.className = 'card cfg-details';
 	        card.style.marginBottom = '16px';
+	        card.open = Boolean(cfgFormOpenState.providers[pid]);
+	        card.addEventListener('toggle', () => { cfgFormOpenState.providers[pid] = Boolean(card.open); });
 
-	        const header = document.createElement('div');
-	        header.style.display = 'flex';
-	        header.style.justifyContent = 'space-between';
-	        header.style.alignItems = 'center';
-	        header.style.marginBottom = '16px';
-	        header.style.paddingBottom = '12px';
-	        header.style.borderBottom = '1px solid var(--border)';
+	        const header = document.createElement('summary');
+
+	        const left = document.createElement('div');
+	        left.className = 'cfg-summary-left';
+	        const caret = document.createElement('span');
+	        caret.className = 'cfg-caret';
+	        caret.textContent = '▸';
+	        left.appendChild(caret);
+	        const icon = document.createElement('span');
+	        icon.style.fontSize = '20px';
+	        icon.textContent = '⚡';
+	        left.appendChild(icon);
+
+	        const titleWrap = document.createElement('div');
+	        titleWrap.style.display = 'grid';
+	        titleWrap.style.gap = '2px';
+	        titleWrap.style.minWidth = '0';
 
 	        const title = document.createElement('div');
-	        title.style.display = 'flex';
-	        title.style.alignItems = 'center';
-	        title.style.gap = '10px';
-	        title.innerHTML = '<span style="font-size:20px">⚡</span><span style="font-weight:700; font-size:16px">' + pid + '</span>';
-	        header.appendChild(title);
+	        title.className = 'cfg-summary-title';
+	        title.textContent = pid;
+	        titleWrap.appendChild(title);
+
+	        const apiMode = safeStr(p.apiMode || '').trim();
+	        const upsCount = Array.isArray(p.upstreams) ? p.upstreams.length : 0;
+	        const v1Models = (!isV2 && p.models && typeof p.models === 'object') ? Object.keys(p.models || {}).length : null;
+	        const metaParts = [];
+	        if (apiMode) metaParts.push('apiMode=' + apiMode);
+	        metaParts.push(upsCount ? ('upstreams=' + upsCount) : 'single-upstream');
+	        if (p.discoverModels) metaParts.push('discoverModels');
+	        if (v1Models != null) metaParts.push('models=' + v1Models);
+	        const meta = document.createElement('div');
+	        meta.className = 'cfg-summary-meta';
+	        meta.textContent = metaParts.join(' · ');
+	        titleWrap.appendChild(meta);
+
+	        left.appendChild(titleWrap);
+	        header.appendChild(left);
+
+	        card.appendChild(header);
+
+	        const body = document.createElement('div');
+	        body.className = 'cfg-details-body';
+
+	        const actionsRow = document.createElement('div');
+	        actionsRow.style.display = 'flex';
+	        actionsRow.style.justifyContent = 'flex-end';
+	        actionsRow.style.marginBottom = '12px';
 
 	        const delBtn = document.createElement('button');
 	        delBtn.className = 'danger';
-	        delBtn.textContent = '🗑️ 删除';
+	        delBtn.textContent = '🗑️ 删除 provider';
 	        delBtn.style.padding = '6px 12px';
 	        delBtn.style.fontSize = '13px';
 	        delBtn.addEventListener('click', (e) => {
@@ -2836,12 +2971,12 @@ function webUiHtml(): string {
 	          delete root.providers[pid];
 	          renderProvidersForm();
 	        });
-	        header.appendChild(delBtn);
-	        card.appendChild(header);
+	        actionsRow.appendChild(delBtn);
+	        body.appendChild(actionsRow);
 
 	        const grid = document.createElement('div');
 	        grid.className = 'grid';
-	        grid.style.marginTop = '16px';
+	        grid.style.marginTop = '0';
 
 	        const apiModeWrap = document.createElement('div');
 	        const apiModeLabel = document.createElement('label');
@@ -3117,28 +3252,34 @@ function webUiHtml(): string {
 
 	          for (const mn of mnames) {
 	            const m = models[mn] || {};
-	            const row = document.createElement('div');
-	            row.style.border = '1px solid var(--border)';
-	            row.style.borderRadius = '10px';
-	            row.style.padding = '12px';
-	            row.style.display = 'grid';
-	            row.style.gap = '10px';
-	            row.style.background = 'var(--bg)';
+	            const key = pid + '::' + mn;
+	            const row = document.createElement('details');
+	            row.className = 'cfg-item';
+	            row.open = Boolean(cfgFormOpenState.v1Models[key]);
+	            row.addEventListener('toggle', () => { cfgFormOpenState.v1Models[key] = Boolean(row.open); });
 
-	            const top = document.createElement('div');
-	            top.style.display = 'flex';
-	            top.style.justifyContent = 'space-between';
-	            top.style.alignItems = 'center';
-	            top.style.paddingBottom = '8px';
-	            top.style.borderBottom = '1px solid var(--border)';
+	            const top = document.createElement('summary');
+	            const left = document.createElement('div');
+	            left.className = 'cfg-summary-left';
+	            const caret = document.createElement('span');
+	            caret.className = 'cfg-caret';
+	            caret.textContent = '▸';
+	            left.appendChild(caret);
 
+	            const titleWrap = document.createElement('div');
+	            titleWrap.style.display = 'grid';
+	            titleWrap.style.gap = '2px';
+	            titleWrap.style.minWidth = '0';
 	            const name = document.createElement('div');
-	            name.style.fontFamily = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
-	            name.style.fontSize = '13px';
-	            name.style.fontWeight = '600';
-	            name.style.color = 'var(--accent-light)';
+	            name.className = 'cfg-summary-title';
 	            name.textContent = '📦 ' + mn;
-	            top.appendChild(name);
+	            titleWrap.appendChild(name);
+	            const meta = document.createElement('div');
+	            meta.className = 'cfg-summary-meta';
+	            meta.textContent = 'upstreamModel=' + safeStr(m.upstreamModel || mn);
+	            titleWrap.appendChild(meta);
+	            left.appendChild(titleWrap);
+	            top.appendChild(left);
 
 	            const rm = document.createElement('button');
 	            rm.className = 'danger';
@@ -3147,6 +3288,7 @@ function webUiHtml(): string {
 	            rm.style.fontSize = '13px';
 	            rm.addEventListener('click', (e) => {
 	              e.preventDefault();
+	              e.stopPropagation();
 	              delete models[mn];
 	              p.models = models;
 	              providers[pid] = p;
@@ -3155,11 +3297,21 @@ function webUiHtml(): string {
 	            top.appendChild(rm);
 	            row.appendChild(top);
 
+	            const body = document.createElement('div');
+	            body.className = 'cfg-item-body';
+
 	            const up = document.createElement('input');
 	            up.placeholder = 'upstreamModel（上游真实模型名）';
 	            up.value = safeStr(m.upstreamModel || mn);
-	            up.addEventListener('input', () => { m.upstreamModel = up.value.trim() || mn; models[mn] = m; p.models = models; providers[pid] = p; });
-	            row.appendChild(up);
+	            up.addEventListener('input', () => {
+	              m.upstreamModel = up.value.trim() || mn;
+	              models[mn] = m;
+	              p.models = models;
+	              providers[pid] = p;
+	              meta.textContent = 'upstreamModel=' + safeStr(m.upstreamModel || mn);
+	            });
+	            body.appendChild(up);
+	            row.appendChild(body);
 
 	            list.appendChild(row);
 	          }
@@ -3168,7 +3320,8 @@ function webUiHtml(): string {
 	          grid.appendChild(modelsWrap);
 	        }
 
-	        card.appendChild(grid);
+	        body.appendChild(grid);
+	        card.appendChild(body);
 	        providersPanel.appendChild(card);
 	      }
 
@@ -3260,32 +3413,45 @@ function webUiHtml(): string {
 	            .filter(Boolean);
 	          const providersText = usedProviders.length ? (' (' + usedProviders.join(', ') + ')') : '（未绑定 provider）';
 
-	          const row = document.createElement('div');
-	          row.style.border = '1px solid var(--border)';
-	          row.style.borderRadius = '10px';
-	          row.style.padding = '12px';
-	          row.style.display = 'grid';
-	          row.style.gap = '10px';
-	          row.style.background = 'var(--bg)';
+	          const row = document.createElement('details');
+	          row.className = 'cfg-item';
+	          row.open = Boolean(cfgFormOpenState.v2Models[mn]);
+	          row.addEventListener('toggle', () => { cfgFormOpenState.v2Models[mn] = Boolean(row.open); });
 
-	          const top = document.createElement('div');
-	          top.style.display = 'flex';
-	          top.style.justifyContent = 'space-between';
-	          top.style.alignItems = 'center';
-	          top.style.paddingBottom = '8px';
-	          top.style.borderBottom = '1px solid var(--border)';
+	          const top = document.createElement('summary');
+	          const left = document.createElement('div');
+	          left.className = 'cfg-summary-left';
+	          const caret = document.createElement('span');
+	          caret.className = 'cfg-caret';
+	          caret.textContent = '▸';
+	          left.appendChild(caret);
 
+	          const titleWrap = document.createElement('div');
+	          titleWrap.style.display = 'grid';
+	          titleWrap.style.gap = '2px';
+	          titleWrap.style.minWidth = '0';
 	          const name = document.createElement('div');
-	          name.style.fontFamily = 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
-	          name.style.fontSize = '13px';
-	          name.style.fontWeight = '600';
-	          name.style.color = 'var(--accent-light)';
+	          name.className = 'cfg-summary-title';
 	          name.textContent = '📦 ' + mn + providersText;
-	          top.appendChild(name);
+	          titleWrap.appendChild(name);
+	          const meta = document.createElement('div');
+	          meta.className = 'cfg-summary-meta';
+	          meta.textContent =
+	            'default upstreamModel=' + safeStr(m.upstreamModel || mn) +
+	            ' · strategy=' + safeStr(route.strategy || 'priority').trim() +
+	            ' · binds=' + String(Array.isArray(route.providers) ? route.providers.length : 0);
+	          titleWrap.appendChild(meta);
+	          left.appendChild(titleWrap);
+	          top.appendChild(left);
+	          row.appendChild(top);
+
+	          const body = document.createElement('div');
+	          body.className = 'cfg-item-body';
 
 	          const actions = document.createElement('div');
 	          actions.style.display = 'flex';
 	          actions.style.gap = '10px';
+	          actions.style.justifyContent = 'flex-end';
 
 	          const addBind = document.createElement('button');
 	          addBind.textContent = '➕ 绑定 provider';
@@ -3322,15 +3488,21 @@ function webUiHtml(): string {
 	            renderProvidersForm();
 	          });
 	          actions.appendChild(rm);
-
-	          top.appendChild(actions);
-	          row.appendChild(top);
+	          body.appendChild(actions);
 
 	          const up = document.createElement('input');
 	          up.placeholder = 'default upstreamModel（默认上游模型名）';
 	          up.value = safeStr(m.upstreamModel || mn);
-	          up.addEventListener('input', () => { m.upstreamModel = up.value.trim() || mn; root.models[mn] = m; cfgObj = root; });
-	          row.appendChild(up);
+	          up.addEventListener('input', () => {
+	            m.upstreamModel = up.value.trim() || mn;
+	            root.models[mn] = m;
+	            cfgObj = root;
+	            meta.textContent =
+	              'default upstreamModel=' + safeStr(m.upstreamModel || mn) +
+	              ' · strategy=' + safeStr(route.strategy || 'priority').trim() +
+	              ' · binds=' + String(Array.isArray(route.providers) ? route.providers.length : 0);
+	          });
+	          body.appendChild(up);
 
 	          const stratWrap = document.createElement('div');
 	          stratWrap.style.display = 'grid';
@@ -3346,10 +3518,18 @@ function webUiHtml(): string {
 	            stratSel.appendChild(opt);
 	          }
 	          stratSel.value = safeStr(route.strategy || 'priority').trim() || 'priority';
-	          stratSel.addEventListener('change', () => { route.strategy = safeStr(stratSel.value).trim() || 'priority'; root.routes[mn] = route; cfgObj = root; });
+	          stratSel.addEventListener('change', () => {
+	            route.strategy = safeStr(stratSel.value).trim() || 'priority';
+	            root.routes[mn] = route;
+	            cfgObj = root;
+	            meta.textContent =
+	              'default upstreamModel=' + safeStr(m.upstreamModel || mn) +
+	              ' · strategy=' + safeStr(route.strategy || 'priority').trim() +
+	              ' · binds=' + String(Array.isArray(route.providers) ? route.providers.length : 0);
+	          });
 	          stratWrap.appendChild(stratLabel);
 	          stratWrap.appendChild(stratSel);
-	          row.appendChild(stratWrap);
+	          body.appendChild(stratWrap);
 
 	          const bindsBox = document.createElement('div');
 	          bindsBox.style.display = 'grid';
@@ -3468,9 +3648,10 @@ function webUiHtml(): string {
 	            bindsBox.appendChild(bindRow);
 	          }
 
-	          row.appendChild(bindsBox);
+	          body.appendChild(bindsBox);
 	          root.routes[mn] = route;
 	          root.models[mn] = m;
+	          row.appendChild(body);
 	          list.appendChild(row);
 	        }
 
@@ -4086,7 +4267,7 @@ function webUiHtml(): string {
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     let reqId = "";
     try {
       reqId = crypto.randomUUID();
@@ -4205,6 +4386,9 @@ export default {
 
       // Token metrics (in-memory; opt-in via WEB_UI_ENABLED or RSP4COPILOT_TOKEN_STATS_ENABLED)
       const metricsEnabled = parseBoolEnv((env as any)?.RSP4COPILOT_TOKEN_STATS_ENABLED) || parseBoolEnv((env as any)?.WEB_UI_ENABLED);
+      if (metricsEnabled) {
+        await ensureStatsLoaded(env);
+      }
       if (request.method === "GET" && path.startsWith("/v1/metrics/tokens")) {
         if (!metricsEnabled) {
           return withCors(jsonResponse(404, tokenMetricsErrorResponse("Token 统计未启用（设置 WEB_UI_ENABLED=true 或 RSP4COPILOT_TOKEN_STATS_ENABLED=true）", "not_found")), corsHeaders);
@@ -4362,6 +4546,7 @@ export default {
             path,
             startedAt,
             extraSystemText,
+            ctx,
           });
           return withCors(resp, corsHeaders);
         }
@@ -4458,6 +4643,8 @@ export default {
                 status: resp.ok ? "ok" : "error",
                 latencyMs: Math.max(0, Date.now() - attemptStartedAt),
               });
+              markStatsDirty();
+              flushStatsIfNeeded(env, ctx);
             } catch {}
           }
 
@@ -4479,6 +4666,10 @@ export default {
                       return 0;
                     }
                   })(),
+                  onMetricRecorded: () => {
+                    markStatsDirty();
+                    flushStatsIfNeeded(env, ctx);
+                  },
                 })
               : resp;
 
@@ -4570,6 +4761,8 @@ export default {
                   status: upstreamResp.ok ? "ok" : "error",
                   latencyMs: Math.max(0, Date.now() - attemptStartedAt),
                 });
+                markStatsDirty();
+                flushStatsIfNeeded(env, ctx);
               } catch {}
             }
 
@@ -4592,6 +4785,10 @@ export default {
                         return 0;
                       }
                     })(),
+                    onMetricRecorded: () => {
+                      markStatsDirty();
+                      flushStatsIfNeeded(env, ctx);
+                    },
                   })
                 : upstreamResp;
 
@@ -4621,6 +4818,7 @@ export default {
           path,
           startedAt,
           extraSystemText: "",
+          ctx,
         });
         if (!openaiResp.ok) return withCors(openaiResp, corsHeaders);
 
@@ -4670,6 +4868,7 @@ export default {
           path,
           startedAt,
           extraSystemText: "",
+          ctx,
         });
         if (!openaiResp.ok) return withCors(openaiResp, corsHeaders);
 
@@ -4744,6 +4943,8 @@ export default {
                 status: resp.ok ? "ok" : "error",
                 latencyMs: Math.max(0, Date.now() - attemptStartedAt),
               });
+              markStatsDirty();
+              flushStatsIfNeeded(env, ctx);
             } catch {}
           }
           lastResp = resp;
@@ -4822,6 +5023,8 @@ export default {
                   status: upstreamResp.ok ? "ok" : "error",
                   latencyMs: Math.max(0, Date.now() - attemptStartedAt),
                 });
+                markStatsDirty();
+                flushStatsIfNeeded(env, ctx);
               } catch {}
             }
 
@@ -4844,6 +5047,10 @@ export default {
                         return 0;
                       }
                     })(),
+                    onMetricRecorded: () => {
+                      markStatsDirty();
+                      flushStatsIfNeeded(env, ctx);
+                    },
                   })
                 : upstreamResp;
 
@@ -4873,6 +5080,7 @@ export default {
           path,
           startedAt,
           extraSystemText: "",
+          ctx,
         });
         if (!openaiResp.ok) return withCors(openaiResp, corsHeaders);
 

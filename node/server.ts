@@ -7,6 +7,69 @@ import worker from "../src/workers";
 import { getWorkerAuthKeys, normalizeAuthValue, parseBoolEnv } from "../src/common";
 import { parseGatewayConfig } from "../src/config";
 
+class FileKvNamespace {
+  readonly filePath: string;
+
+  constructor(filePath: string) {
+    this.filePath = String(filePath || "").trim();
+  }
+
+  async get(_key: string): Promise<string | null> {
+    try {
+      if (!this.filePath) return null;
+      if (!existsSync(this.filePath)) return null;
+      const content = readFileSync(this.filePath, "utf8");
+      return typeof content === "string" && content.trim() ? content : null;
+    } catch {
+      return null;
+    }
+  }
+
+  async put(_key: string, value: string): Promise<void> {
+    if (!this.filePath) return;
+    const dir = dirname(this.filePath);
+    const tmp = `${this.filePath}.${Date.now()}.tmp`;
+    try {
+      // Ensure directory exists (Docker default: /config is mounted)
+      if (dir && !existsSync(dir)) {
+        // no mkdir here; if missing, just fail silently
+      }
+      writeFileSync(tmp, String(value ?? ""), "utf8");
+      renameSync(tmp, this.filePath);
+    } catch (err) {
+      try {
+        // Best-effort cleanup: overwrite target if rename fails on some FS.
+        writeFileSync(this.filePath, String(value ?? ""), "utf8");
+      } catch {}
+      try {
+        if (existsSync(tmp)) renameSync(tmp, tmp + ".failed");
+      } catch {}
+      const msg = err instanceof Error ? err.message : String(err ?? "write failed");
+      console.error(`[rsp4copilot] stats persist failed (${this.filePath}): ${msg}`);
+    }
+  }
+}
+
+function statsPersistEnabled(): boolean {
+  const raw = process.env.RSP4COPILOT_STATS_PERSIST;
+  if (raw == null) return true;
+  return parseBoolEnv(raw);
+}
+
+function getStatsFilePath(): string {
+  const p = String(process.env.RSP4COPILOT_STATS_FILE || "").trim();
+  return p || "/config/rsp4copilot.stats.json";
+}
+
+let statsKvSingleton: FileKvNamespace | null = null;
+function getStatsKv(): FileKvNamespace {
+  const filePath = getStatsFilePath();
+  if (!statsKvSingleton || statsKvSingleton.filePath !== filePath) {
+    statsKvSingleton = new FileKvNamespace(filePath);
+  }
+  return statsKvSingleton;
+}
+
 function normalizeRemoteAddress(raw: unknown): string {
   let ip = String(raw ?? "").trim();
   if (!ip) return "";
@@ -262,8 +325,8 @@ function isOriginAllowed(origin: string, hostHeader: string): boolean {
   }
 }
 
-function buildEnv(): Record<string, string | undefined> {
-  const env: Record<string, string | undefined> = {};
+function buildEnv(): Record<string, any> {
+  const env: Record<string, any> = {};
   for (const [k, v] of Object.entries(process.env)) env[k] = v;
 
   // Optional overlay env file (for web-managed upstream keys in Docker).
@@ -288,6 +351,12 @@ function buildEnv(): Record<string, string | undefined> {
         console.error(`[rsp4copilot] failed to read RSP4COPILOT_CONFIG_FILE (${file}): ${message}`);
       }
     }
+  }
+
+  // Stats persistence (Node/Docker): provide a KV-like binding backed by a local file.
+  // Worker side will use env.RSP4COPILOT_STATS_KV if present.
+  if (statsPersistEnabled()) {
+    env.RSP4COPILOT_STATS_KV = getStatsKv();
   }
 
   return env;
@@ -336,7 +405,7 @@ function mayWriteSecrets(): boolean {
   return parseBoolEnv(process.env.WEB_UI_SECRETS_WRITE);
 }
 
-function pickGatewayAuthKey(env: Record<string, string | undefined>): string {
+function pickGatewayAuthKey(env: Record<string, any>): string {
   const keys = getWorkerAuthKeys(env as any);
   return keys.length ? keys[0] : "";
 }

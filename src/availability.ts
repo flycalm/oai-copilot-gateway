@@ -22,6 +22,12 @@ export type AvailabilityMetricAgg = {
   latencyMsCount: number;
 };
 
+export type AvailabilityMetricsPersistedStateV1 = {
+  v: 1;
+  recent: AvailabilityMetricRecord[];
+  daily: Record<string, Record<string, AvailabilityMetricAgg>>;
+};
+
 function dateKeyUtc(ts: number): string {
   try {
     return new Date(ts).toISOString().slice(0, 10);
@@ -255,6 +261,50 @@ export class AvailabilityMetricsStore {
       days: byDay,
     };
   }
+
+  exportState(): AvailabilityMetricsPersistedStateV1 {
+    const daily: Record<string, Record<string, AvailabilityMetricAgg>> = {};
+    for (const [date, m] of this.dailyByUpstreamModel.entries()) {
+      const obj: Record<string, AvailabilityMetricAgg> = {};
+      for (const [k, a] of m.entries()) obj[k] = a;
+      daily[date] = obj;
+    }
+    return { v: 1, recent: this.recent.slice(0, this.maxRecent), daily };
+  }
+
+  importState(state: unknown): void {
+    const s = state && typeof state === "object" ? (state as any) : null;
+    if (!s || Number(s.v) !== 1) return;
+
+    const nextRecent: AvailabilityMetricRecord[] = Array.isArray(s.recent) ? (s.recent as any[]).filter((x) => x && typeof x === "object") : [];
+    this.recent = nextRecent.slice(0, this.maxRecent) as any;
+
+    const dailyRaw = s.daily && typeof s.daily === "object" ? (s.daily as any) : null;
+    const nextDaily = new Map<string, Map<string, AvailabilityMetricAgg>>();
+    if (dailyRaw) {
+      for (const [date, v] of Object.entries(dailyRaw)) {
+        if (typeof date !== "string" || !date) continue;
+        const dayObj = v && typeof v === "object" ? (v as any) : null;
+        if (!dayObj) continue;
+        const mm = new Map<string, AvailabilityMetricAgg>();
+        for (const [k, a] of Object.entries(dayObj)) {
+          if (typeof k !== "string" || !k) continue;
+          const aa = a && typeof a === "object" ? (a as any) : null;
+          if (!aa) continue;
+          mm.set(k, {
+            requests: Number.isFinite(Number(aa.requests)) ? Math.max(0, Math.floor(Number(aa.requests))) : 0,
+            ok: Number.isFinite(Number(aa.ok)) ? Math.max(0, Math.floor(Number(aa.ok))) : 0,
+            error: Number.isFinite(Number(aa.error)) ? Math.max(0, Math.floor(Number(aa.error))) : 0,
+            latencyMsSum: Number.isFinite(Number(aa.latencyMsSum)) ? Math.max(0, Math.floor(Number(aa.latencyMsSum))) : 0,
+            latencyMsCount: Number.isFinite(Number(aa.latencyMsCount)) ? Math.max(0, Math.floor(Number(aa.latencyMsCount))) : 0,
+          });
+        }
+        if (mm.size) nextDaily.set(date, mm);
+      }
+    }
+    this.dailyByUpstreamModel = nextDaily;
+    this.prune();
+  }
 }
 
 export const availabilityMetrics = new AvailabilityMetricsStore();
@@ -262,4 +312,3 @@ export const availabilityMetrics = new AvailabilityMetricsStore();
 export function availabilityMetricsErrorResponse(message: string, code = "not_found"): any {
   return jsonError(message, code);
 }
-

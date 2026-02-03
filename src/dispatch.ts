@@ -7,6 +7,8 @@ import { handleOpenAIChatCompletionsUpstream, handleOpenAIRequest } from "./prov
 import { listUpstreamCandidates, shouldTryNextUpstreamCandidateStatus } from "./upstreams";
 import { instrumentResponseAndRecordTokens, tokenEstimates } from "./metrics";
 import { availabilityMetrics } from "./availability";
+import { flushStatsIfNeeded, markStatsDirty } from "./stats_persist";
+import type { ExecutionContextLike } from "./stats_persist";
 
 function envWithOverrides(env: Env, overrides: Record<string, string> | null): Env {
   const base = env && typeof env === "object" ? env : {};
@@ -40,6 +42,7 @@ export async function dispatchOpenAIChatToProvider({
   path,
   startedAt,
   extraSystemText,
+  ctx,
 }: {
   request: Request;
   env: Env;
@@ -54,6 +57,7 @@ export async function dispatchOpenAIChatToProvider({
   path?: string;
   startedAt?: number;
   extraSystemText: string;
+  ctx?: ExecutionContextLike;
 }): Promise<Response> {
   const metricsEnabled = parseBoolEnv((env as any)?.RSP4COPILOT_TOKEN_STATS_ENABLED) || parseBoolEnv((env as any)?.WEB_UI_ENABLED);
   const estimatedPromptTokens = (() => {
@@ -78,6 +82,8 @@ export async function dispatchOpenAIChatToProvider({
         status: resp0 && resp0.ok ? "ok" : "error",
         latencyMs: Math.max(0, Date.now() - attemptStartedAt),
       });
+      markStatsDirty();
+      flushStatsIfNeeded(env, ctx);
     } catch {}
   };
 
@@ -152,6 +158,10 @@ export async function dispatchOpenAIChatToProvider({
             upstreamId: upstream.id || provider.id,
             model: model.name || model.upstreamModel,
             estimatedPromptTokens,
+            onMetricRecorded: () => {
+              markStatsDirty();
+              flushStatsIfNeeded(env, ctx);
+            },
           })
         : resp0;
 
@@ -209,6 +219,10 @@ export async function dispatchOpenAIChatToProvider({
             upstreamId: upstream.id || provider.id,
             model: model.name || model.upstreamModel,
             estimatedPromptTokens,
+            onMetricRecorded: () => {
+              markStatsDirty();
+              flushStatsIfNeeded(env, ctx);
+            },
           })
         : resp0;
 
@@ -261,6 +275,10 @@ export async function dispatchOpenAIChatToProvider({
             upstreamId: upstream.id || provider.id,
             model: model.name || model.upstreamModel,
             estimatedPromptTokens,
+            onMetricRecorded: () => {
+              markStatsDirty();
+              flushStatsIfNeeded(env, ctx);
+            },
           })
         : resp0;
 
@@ -302,6 +320,10 @@ export async function dispatchOpenAIChatToProvider({
             upstreamId: upstream.id || provider.id,
             model: model.name || model.upstreamModel,
             estimatedPromptTokens,
+            onMetricRecorded: () => {
+              markStatsDirty();
+              flushStatsIfNeeded(env, ctx);
+            },
           })
         : resp0;
 
