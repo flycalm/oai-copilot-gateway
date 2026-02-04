@@ -648,6 +648,43 @@ async function openaiChatToGeminiRequest(reqJson, env, fetchFn, extraSystemText,
     return { callId, part: { functionResponse: { name, response: responseValue } } };
   };
 
+  const toolMessageToTextPart = (msg, fallbackName = "") => {
+    if (!msg || typeof msg !== "object") return null;
+    const callIdRaw = msg.tool_call_id ?? msg.toolCallId ?? msg.call_id ?? msg.callId ?? msg.id;
+    const callId = typeof callIdRaw === "string" ? callIdRaw.trim() : "";
+    const mappedName = callId ? toolNameByCallId.get(callId) || "" : "";
+    const cachedName =
+      callId && sigCache && typeof sigCache === "object" && sigCache[callId] && typeof sigCache[callId].name === "string"
+        ? String(sigCache[callId].name).trim()
+        : "";
+    const name = mappedName || cachedName || fallbackName || "";
+
+    const content = (msg as any).content;
+    const raw =
+      typeof content === "string"
+        ? content
+        : content == null
+          ? ""
+          : (() => {
+              try {
+                return JSON.stringify(content);
+              } catch {
+                return String(content);
+              }
+            })();
+    const rawText = typeof raw === "string" ? raw : String(raw ?? "");
+
+    const header = `[tool_result]${name ? ` ${name}` : ""}${callId ? ` (call_id=${callId})` : ""}`;
+    const text = rawText && rawText.trim() ? `${header}\n${rawText}` : header;
+    return { callId, part: { text } };
+  };
+
+  const toolCallToTextPart = (name: string, callId: string, argsText: string) => {
+    const header = `[tool_call] ${name}${callId ? ` (call_id=${callId})` : ""}`;
+    const text = argsText && argsText.trim() ? `${header}\n${argsText}` : header;
+    return { text };
+  };
+
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     if (!msg || typeof msg !== "object") continue;
@@ -672,6 +709,15 @@ async function openaiChatToGeminiRequest(reqJson, env, fetchFn, extraSystemText,
 
       const calls = normalizeToolCallsFromChatMessage(msg);
       const callOrder: any[] = [];
+      const callMeta: Array<{
+        call_id: string;
+        name: string;
+        argsText: string;
+        argsObj: any;
+        thoughtSig: string;
+        thought: string;
+      }> = [];
+
       for (const c of calls) {
         toolNameByCallId.set(c.call_id, c.name);
         callOrder.push({ call_id: c.call_id, name: c.name });
@@ -685,20 +731,45 @@ async function openaiChatToGeminiRequest(reqJson, env, fetchFn, extraSystemText,
           thought = sigCache[c.call_id].thought || thought;
         }
 
+        callMeta.push({
+          call_id: c.call_id,
+          name: c.name,
+          argsText: typeof c.arguments === "string" ? c.arguments : String(c.arguments ?? ""),
+          argsObj: parsedArgs.ok && parsedArgs.value && typeof parsedArgs.value === "object" ? parsedArgs.value : { _raw: c.arguments },
+          thoughtSig: typeof thoughtSig === "string" ? thoughtSig.trim() : "",
+          thought: typeof thought === "string" ? thought : "",
+        });
+      }
+
+      // Some Gemini gateways reject historical functionCall parts unless a thought_signature is present.
+      // If we can't find the signature (e.g. client didn't send stable x-session-id/user so cache miss),
+      // degrade tool-call history into plain text to avoid upstream 400s.
+      const mustDegradeToolHistory = callMeta.some((m) => m.name && !m.thoughtSig);
+
+      for (const m of callMeta) {
+        if (mustDegradeToolHistory) {
+          parts.push(toolCallToTextPart(m.name, m.call_id, m.argsText));
+          continue;
+        }
+
         // Build the functionCall part (2025 API: thoughtSignature is sibling to functionCall in same part)
         const fcPart: any = {
           functionCall: {
-            name: c.name,
-            args: parsedArgs.ok && parsedArgs.value && typeof parsedArgs.value === "object" ? parsedArgs.value : { _raw: c.arguments },
+            name: m.name,
+            args: m.argsObj,
           },
         };
 
-        // Add thoughtSignature to the same part (camelCase as returned by Gemini)
-        if (thoughtSig) {
-          fcPart.thoughtSignature = thoughtSig;
+        // Add thought signature next to functionCall. Include both casings for proxy compatibility.
+        if (m.thoughtSig) {
+          fcPart.thoughtSignature = m.thoughtSig;
+          fcPart.thought_signature = m.thoughtSig;
+          // Some non-official gateways expect the signature nested under functionCall.
+          fcPart.functionCall.thoughtSignature = m.thoughtSig;
+          fcPart.functionCall.thought_signature = m.thoughtSig;
         }
-        if (thought) {
-          fcPart.thought = thought;
+        if (m.thought) {
+          fcPart.thought = m.thought;
         }
 
         parts.push(fcPart);
@@ -710,6 +781,7 @@ async function openaiChatToGeminiRequest(reqJson, env, fetchFn, extraSystemText,
       // containing the same number of functionResponse parts as the preceding model's functionCall parts.
       if (calls.length) {
         const responsesByCallId = new Map();
+        const textByCallId = new Map();
         let j = i + 1;
         while (j < messages.length) {
           const m2 = messages[j];
@@ -719,22 +791,33 @@ async function openaiChatToGeminiRequest(reqJson, env, fetchFn, extraSystemText,
 
           const item = toolMessageToFunctionResponsePart(m2);
           if (item && item.callId) responsesByCallId.set(item.callId, item.part);
+          const tItem = toolMessageToTextPart(m2);
+          if (tItem && tItem.callId) textByCallId.set(tItem.callId, tItem.part);
           j++;
         }
 
         // Only emit functionResponses if the history actually includes tool messages for this turn.
         if (j > i + 1) {
-          const respParts: any[] = [];
-          for (const c of callOrder) {
-            const found = responsesByCallId.get(c.call_id);
-            if (found) {
-              respParts.push(found);
-            } else {
-              // Keep the turn structurally valid even if a tool result is missing.
-              respParts.push({ functionResponse: { name: c.name, response: { output: "" } } });
+          if (mustDegradeToolHistory) {
+            const respTextParts: any[] = [];
+            for (const c of callOrder) {
+              const found = textByCallId.get(c.call_id);
+              respTextParts.push(found ?? toolMessageToTextPart({ tool_call_id: c.call_id, content: "" }, c.name)?.part ?? { text: `[tool_result] ${c.name}` });
             }
+            contents.push({ role: "user", parts: respTextParts });
+          } else {
+            const respParts: any[] = [];
+            for (const c of callOrder) {
+              const found = responsesByCallId.get(c.call_id);
+              if (found) {
+                respParts.push(found);
+              } else {
+                // Keep the turn structurally valid even if a tool result is missing.
+                respParts.push({ functionResponse: { name: c.name, response: { output: "" } } });
+              }
+            }
+            contents.push({ role: "user", parts: respParts });
           }
-          contents.push({ role: "user", parts: respParts });
           i = j - 1; // consume tool messages
         }
       }
@@ -751,7 +834,12 @@ async function openaiChatToGeminiRequest(reqJson, env, fetchFn, extraSystemText,
         const r2 = typeof m2.role === "string" ? m2.role : "";
         if (r2 !== "tool") break;
         const item = toolMessageToFunctionResponsePart(m2);
-        if (item?.part) respParts.push(item.part);
+        if (item?.part) {
+          respParts.push(item.part);
+        } else {
+          const tItem = toolMessageToTextPart(m2);
+          if (tItem?.part) respParts.push(tItem.part);
+        }
         j++;
       }
       if (respParts.length) contents.push({ role: "user", parts: respParts });
