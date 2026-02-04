@@ -1,4 +1,4 @@
-import { joinUrls, jsonError, jsonResponse, normalizeAuthValue, parseBoolEnv, parseUpstreamCustomHeaders } from "./common";
+import { joinUrls, jsonError, jsonResponse, logDebug, normalizeAuthValue, parseBoolEnv, parseUpstreamCustomHeaders } from "./common";
 import type { Env } from "./common";
 import type { GatewayConfig, ModelConfig, ProviderConfig } from "./config";
 import { handleClaudeChatCompletions } from "./providers/claude";
@@ -95,6 +95,21 @@ export async function dispatchOpenAIChatToProvider({
   const inheritedCustomHeaders = parseUpstreamCustomHeaders(env);
   const providerApiMode = typeof provider.apiMode === "string" ? provider.apiMode.trim() : "";
 
+  if (debug) {
+    logDebug(debug, reqId, "upstream candidates", {
+      providerId: provider.id,
+      apiMode: providerApiMode,
+      streamRequested: stream,
+      count: upstreamCandidates.length,
+      candidates: upstreamCandidates.map((u, idx) => ({
+        idx,
+        upstreamId: u.id || provider.id,
+        baseURLsCount: Array.isArray(u.baseURLs) ? u.baseURLs.length : 0,
+        baseURLsPreview: Array.isArray(u.baseURLs) ? u.baseURLs.slice(0, 2) : [],
+      })),
+    });
+  }
+
   let lastResp: Response | null = null;
   for (let i = 0; i < upstreamCandidates.length; i++) {
     const upstream = upstreamCandidates[i];
@@ -103,6 +118,17 @@ export async function dispatchOpenAIChatToProvider({
       upstream.customHeader && Object.keys(upstream.customHeader).length ? { ...inheritedCustomHeaders, ...upstream.customHeader } : null;
     const upstreamHeadersEnv =
       upstreamHeaders && Object.keys(upstreamHeaders).length ? JSON.stringify(upstreamHeaders) : "";
+
+    if (debug) {
+      logDebug(debug, reqId, "upstream attempt", {
+        providerId: provider.id,
+        apiMode: providerApiMode,
+        attempt: i + 1,
+        attemptsTotal: upstreamCandidates.length,
+        upstreamId: upstream.id || provider.id,
+        baseURLsCount: Array.isArray(upstream.baseURLs) ? upstream.baseURLs.length : 0,
+      });
+    }
 
     if (providerApiMode === "openai-responses") {
       const quirks = upstream.quirks || {};

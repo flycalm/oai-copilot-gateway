@@ -1,10 +1,10 @@
 import { createServer } from "node:http";
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { Readable } from "node:stream";
 
 import worker from "../src/workers";
-import { getWorkerAuthKeys, normalizeAuthValue, parseBoolEnv } from "../src/common";
+import { getWorkerAuthKeys, normalizeAuthValue, parseBoolEnv, safeJsonStringifyForLog } from "../src/common";
 import { parseGatewayConfig } from "../src/config";
 
 class FileKvNamespace {
@@ -59,6 +59,51 @@ function statsPersistEnabled(): boolean {
 function getStatsFilePath(): string {
   const p = String(process.env.RSP4COPILOT_STATS_FILE || "").trim();
   return p || "/config/rsp4copilot.stats.json";
+}
+
+function installStructuredDebugLogSink(): void {
+  // When set, write structured debug logs to a local JSONL file (Docker-friendly).
+  // This is only available in Node runtime; Worker runtime will simply ignore the sink.
+  const filePath = String(process.env.RSP4COPILOT_LOG_FILE || process.env.RSP4COPILOT_DEBUG_LOG_FILE || "").trim();
+  if (!filePath) return;
+
+  const maxBytesRaw = String(process.env.RSP4COPILOT_LOG_MAX_BYTES || "").trim();
+  const maxBytes = maxBytesRaw ? Number(maxBytesRaw) : 20 * 1024 * 1024;
+  const maxStringLenRaw = String(process.env.RSP4COPILOT_LOG_MAX_STRING || "").trim();
+  const maxStringLen = maxStringLenRaw ? Number(maxStringLenRaw) : 4000;
+
+  try {
+    const dir = dirname(filePath);
+    if (dir) mkdirSync(dir, { recursive: true });
+  } catch {}
+
+  let approxBytes = 0;
+  try {
+    approxBytes = statSync(filePath).size;
+  } catch {
+    approxBytes = 0;
+  }
+
+  const rotateIfNeeded = () => {
+    if (!(Number.isFinite(maxBytes) && maxBytes > 0)) return;
+    if (approxBytes < maxBytes) return;
+    try {
+      const rotated = `${filePath}.${Date.now()}.jsonl`;
+      if (existsSync(filePath)) renameSync(filePath, rotated);
+      approxBytes = 0;
+    } catch {}
+  };
+
+  (globalThis as any).__rsp4copilot_log_sink = (record: any) => {
+    try {
+      rotateIfNeeded();
+      const line = safeJsonStringifyForLog(record, Number.isFinite(maxStringLen) && maxStringLen > 0 ? maxStringLen : 4000) + "\n";
+      writeFileSync(filePath, line, { encoding: "utf8", flag: "a" });
+      approxBytes += line.length;
+    } catch {}
+  };
+
+  console.error(`[rsp4copilot] debug log file enabled: ${filePath}`);
 }
 
 let statsKvSingleton: FileKvNamespace | null = null;
@@ -392,6 +437,8 @@ async function readBody(req: any): Promise<Uint8Array | undefined> {
 const host = process.env.HOST || "0.0.0.0";
 const port = Number(process.env.PORT || "8788");
 
+installStructuredDebugLogSink();
+
 function getConfigFilePath(): string {
   const p = String(process.env.RSP4COPILOT_CONFIG_FILE || "").trim();
   return p || "/config/rsp4copilot.config.jsonc";
@@ -436,6 +483,41 @@ function isCopilotStreamingEndpoint(url: URL, method: unknown): boolean {
 function wantsEventStream(acceptHeader: unknown): boolean {
   const a = String(acceptHeader ?? "");
   return a.toLowerCase().includes("text/event-stream");
+}
+
+function isTruthyStreamFlag(v: unknown): boolean {
+  if (v === true) return true;
+  if (typeof v === "number") return Number.isFinite(v) && v !== 0;
+  const s = typeof v === "string" ? v.trim().toLowerCase() : "";
+  return s === "1" || s === "true" || s === "yes" || s === "on";
+}
+
+function requestBodyWantsStream(body: Uint8Array | undefined, contentType: unknown): boolean {
+  if (!body) return false;
+  const ct = String(contentType ?? "").toLowerCase();
+  if (!ct.includes("json")) return false;
+  let text = "";
+  try {
+    text = Buffer.from(body as any).toString("utf8");
+  } catch {
+    return false;
+  }
+  if (!text.includes("\"stream\"")) return false;
+  try {
+    const obj = JSON.parse(text);
+    return isTruthyStreamFlag(obj?.stream);
+  } catch {
+    return false;
+  }
+}
+
+function nodeEarlySseEnabled(): boolean {
+  // Node can optionally "prime" the connection by writing a small SSE comment before the worker
+  // response body is available. This used to be necessary when the worker awaited upstream before
+  // returning a Response, but now the worker itself streams an initial chunk immediately.
+  //
+  // Leave this OFF by default for maximum client compatibility.
+  return parseBoolEnv(process.env.RSP4COPILOT_NODE_EARLY_SSE);
 }
 
 const server = createServer(async (req, res) => {
@@ -839,30 +921,24 @@ const server = createServer(async (req, res) => {
       return res.end(await resp.text());
     }
 
-    // VS Code Copilot (via oai-compatible-copilot) can surface a generic `fetch failed` if it
-    // doesn't receive any response bytes quickly enough. To make streaming robust (especially
-    // when upstream TTFB is slow), we flush an SSE response immediately and then pipe the
-    // worker's streaming body when it becomes available.
+    const body = await readBody(req);
+    const clientIp = normalizeRemoteAddress(req.socket?.remoteAddress);
+    const headersObj: Record<string, string | string[] | undefined> = { ...req.headers };
+    if (clientIp) headersObj["x-rsp4copilot-client-ip"] = clientIp;
+    const request = new Request(url.toString(), { method: req.method || "GET", headers: toHeaders(headersObj), body });
+
+    // VS Code Copilot (via oai-compatible-copilot) can surface a generic `fetch failed` (or keep spinning)
+    // if it doesn't receive any response bytes quickly enough. To make streaming robust (especially when
+    // upstream TTFB is slow), we flush an SSE response immediately and then pipe the worker's streaming
+    // body when it becomes available.
     //
-    // This behavior is intentionally gated by user-agent + endpoint + Accept header so it
-    // doesn't affect other clients.
-    const shouldEarlySse =
-      isOaiCopilotUserAgent(req.headers["user-agent"]) &&
-      isCopilotStreamingEndpoint(url, req.method) &&
-      wantsEventStream(req.headers.accept);
+    // Important: oai-compatible-copilot sends `Accept: */*`, so we must NOT rely on the Accept header.
+    const isCopilotUa = isOaiCopilotUserAgent(req.headers["user-agent"]);
+    const isStreamEndpoint = isCopilotStreamingEndpoint(url, req.method);
+    const streamRequested = wantsEventStream(req.headers.accept) || requestBodyWantsStream(body, req.headers["content-type"]);
+    const shouldEarlySse = nodeEarlySseEnabled() && isCopilotUa && isStreamEndpoint && streamRequested;
 
     if (shouldEarlySse) {
-      const body = await readBody(req);
-      const clientIp = normalizeRemoteAddress(req.socket?.remoteAddress);
-      const headersObj: Record<string, string | string[] | undefined> = { ...req.headers };
-      if (clientIp) headersObj["x-rsp4copilot-client-ip"] = clientIp;
-
-      const request = new Request(url.toString(), {
-        method: req.method || "GET",
-        headers: toHeaders(headersObj),
-        body,
-      });
-
       const env = buildEnv();
       const workerFetchPromise = worker.fetch(request, env as any);
 
@@ -874,18 +950,7 @@ const server = createServer(async (req, res) => {
       res.setHeader("x-accel-buffering", "no");
       res.setHeader("x-rsp4copilot-early-sse", "1");
       (res as any).flushHeaders?.();
-      try {
-        const pingChunk = {
-          id: "",
-          object: "chat.completion.chunk",
-          created: Math.floor(Date.now() / 1000),
-          model: "",
-          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
-        };
-        res.write(`data: ${JSON.stringify(pingChunk)}\n\n`);
-      } catch {
-        res.write(": rsp4copilot\n\n");
-      }
+      res.write(": rsp4copilot early-sse\n\n");
 
       void (async () => {
         try {
@@ -918,16 +983,6 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    const body = await readBody(req);
-    const clientIp = normalizeRemoteAddress(req.socket?.remoteAddress);
-    const headersObj: Record<string, string | string[] | undefined> = { ...req.headers };
-    if (clientIp) headersObj["x-rsp4copilot-client-ip"] = clientIp;
-    const request = new Request(url.toString(), {
-      method: req.method || "GET",
-      headers: toHeaders(headersObj),
-      body,
-    });
-
     const env = buildEnv();
     const resp = await worker.fetch(request, env as any);
 
@@ -935,7 +990,7 @@ const server = createServer(async (req, res) => {
     for (const [k, v] of resp.headers.entries()) res.setHeader(k, v);
 
     if (!resp.body) return res.end();
-      Readable.fromWeb(resp.body as any).pipe(res);
+    Readable.fromWeb(resp.body as any).pipe(res);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err ?? "unknown error");
     res.statusCode = 500;

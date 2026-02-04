@@ -427,6 +427,17 @@ export function logDebug(enabled: boolean, reqId: string, label: string, data: u
   } else {
     console.log(`${prefix} ${label}`, data);
   }
+
+  // Optional structured log sink (Node/Docker can install one via `globalThis.__rsp4copilot_log_sink`).
+  // Keep this best-effort and silent on failures to avoid breaking Worker runtime.
+  try {
+    const sink = (globalThis as any).__rsp4copilot_log_sink;
+    if (typeof sink === "function") {
+      const record: any = { ts: Date.now(), level: "debug", reqId: reqId || "", label };
+      if (data !== undefined) record.data = data;
+      sink(record);
+    }
+  } catch {}
 }
 
 export function normalizeAuthValue(raw: unknown): string {

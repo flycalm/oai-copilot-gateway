@@ -1599,6 +1599,29 @@ function buildChatCompletionsSseFromNonStreamJson(parsed: any, fallbackModel: st
   });
 }
 
+function normalizeUsageForChatCompletionsClient(raw: unknown): { prompt_tokens: number; completion_tokens: number; total_tokens: number } | null {
+  const u = raw && typeof raw === "object" ? (raw as any) : null;
+  if (!u) return null;
+
+  const pick = (...vals: any[]): number | null => {
+    for (const v of vals) {
+      const n = typeof v === "number" ? v : Number(String(v ?? ""));
+      if (Number.isFinite(n) && n >= 0) return Math.floor(n);
+    }
+    return null;
+  };
+
+  const prompt = pick(u.prompt_tokens, u.promptTokens, u.input_tokens, u.inputTokens);
+  const completion = pick(u.completion_tokens, u.completionTokens, u.output_tokens, u.outputTokens);
+  const total = pick(u.total_tokens, u.totalTokens);
+
+  if (prompt == null && completion == null && total == null) return null;
+  const p = prompt ?? 0;
+  const c = completion ?? 0;
+  const t = total ?? p + c;
+  return { prompt_tokens: p, completion_tokens: c, total_tokens: t };
+}
+
 function tryExtractToolCallsFromText(content: string): Array<{ name: string; args: unknown }> | null {
   const text = typeof content === "string" ? content.trim() : "";
   if (!text) return null;
@@ -3191,6 +3214,9 @@ export async function handleOpenAIChatCompletionsUpstream({
       streamRequested: Boolean(stream),
       upstreamStream,
       forceNonStreamUpstream,
+      userAgent: request.headers.get("user-agent") || "",
+      isCopilotUa,
+      copilotUpstreamStream,
       toolsCount: Array.isArray((body as any)?.tools) ? (body as any).tools.length : 0,
       toolChoice: (body as any)?.tool_choice ?? null,
       messagesCount: Array.isArray((body as any)?.messages) ? (body as any).messages.length : 0,
@@ -3219,6 +3245,255 @@ export async function handleOpenAIChatCompletionsUpstream({
   void path;
   void startedAt;
 
+  // For Copilot clients we often force `upstreamStream=false` to avoid hanging relays.
+  // However some clients will keep retrying if they don't receive any `data:` bytes quickly.
+  // In that case, stream a valid "role" chunk immediately, then fetch upstream in the background
+  // and emit the rest of the chunks when available.
+  if (stream && !upstreamStream) {
+    const outModel = model;
+    const created = Math.floor(Date.now() / 1000);
+    const id = `chatcmpl_${crypto.randomUUID().replace(/-/g, "")}`;
+    const encoder = new TextEncoder();
+    const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+    const writer = writable.getWriter();
+
+    void (async () => {
+      const streamStartedAt = Date.now();
+      const writeSse = async (objOrDone: any) => {
+        const data = objOrDone === "[DONE]" ? "[DONE]" : JSON.stringify(objOrDone);
+        await writer.write(encoder.encode(encodeSseData(data)));
+      };
+
+      const writeError = async (message: string) => {
+        const payload = jsonError(message, "bad_gateway");
+        await writeSse(payload);
+        await writeSse("[DONE]");
+      };
+
+      try {
+        // First byte(s): a real OpenAI chunk (not a comment) so strict clients count it as progress.
+        await writeSse({
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model: outModel,
+          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+        });
+
+        const sel = await selectUpstreamResponseAny(upstreamUrls, headers, [body], debug, reqId);
+        if (!sel.ok) {
+          if (debug) {
+            logDebug(debug, reqId, "openai chat-completions upstream failed", {
+              path,
+              upstreamUrl: sel.upstreamUrl,
+              status: sel.status,
+              error: sel.error,
+            });
+          }
+          await writeError(`Upstream error: HTTP ${sel.status}`);
+          return;
+        }
+
+        const resp = sel.resp;
+        const text = await resp.text().catch(() => "");
+        if (!resp.ok || resp.status >= 400) {
+          await writeError(`Upstream error: HTTP ${resp.status || 500}`);
+          return;
+        }
+
+        let parsed: any = null;
+        try {
+          parsed = text ? JSON.parse(text) : null;
+        } catch {
+          parsed = null;
+        }
+        if (!parsed || typeof parsed !== "object") {
+          await writeError("Upstream returned invalid JSON");
+          return;
+        }
+
+        // Fallback: some OpenAI-compatible relays for Claude-like models ignore tool calling and instead
+        // "describe" the tool invocation in plain text. Convert that into a real `tool_calls` message
+        // so Copilot clients can trigger their confirmation UI.
+        try {
+          const toolsCount = Array.isArray((body as any)?.tools) ? (body as any).tools.length : 0;
+          const choice0 = Array.isArray(parsed?.choices) ? parsed.choices[0] : null;
+          const msg0 = choice0 && typeof choice0 === "object" ? (choice0 as any).message : null;
+          const existingToolCalls = Array.isArray(msg0?.tool_calls) ? msg0.tool_calls : [];
+          if (toolsCount > 0 && msg0 && existingToolCalls.length === 0) {
+            const content0 = normalizeMessageContent(msg0?.content);
+            const extracted = typeof content0 === "string" ? tryExtractToolCallsFromText(content0) : null;
+            if (extracted && extracted.length) {
+              const toolCalls = extracted
+                .filter((c) => c && typeof c === "object" && typeof c.name === "string" && c.name.trim())
+                .map((c) => ({
+                  id: `call_${crypto.randomUUID().replace(/-/g, "")}`,
+                  type: "function",
+                  function: {
+                    name: String(c.name || ""),
+                    arguments: typeof c.args === "string" ? c.args : JSON.stringify(c.args ?? {}),
+                  },
+                }));
+              if (toolCalls.length) {
+                msg0.tool_calls = toolCalls;
+                msg0.content = null;
+                if (choice0 && typeof choice0 === "object") (choice0 as any).finish_reason = "tool_calls";
+                if (debug) {
+                  logDebug(debug, reqId, "openai tool_calls inferred from text", { toolCalls: toolCalls.map((t) => t.function?.name || "") });
+                }
+              }
+            }
+          }
+        } catch {}
+
+        const choice0 = Array.isArray(parsed?.choices) ? parsed.choices[0] : null;
+        const msg0 = choice0 && typeof choice0 === "object" ? (choice0 as any).message : null;
+        const finishReason0 = typeof (choice0 as any)?.finish_reason === "string" ? String((choice0 as any).finish_reason) : "stop";
+
+        const normalizeChatToolCallsFromChatMessage = (msg: any): any[] => {
+          const out: any[] = [];
+          if (!msg || typeof msg !== "object") return out;
+
+          const normalizeArgs = (args: any): string => {
+            if (typeof args === "string") return args;
+            if (args == null) return "{}";
+            try {
+              return JSON.stringify(args);
+            } catch {
+              return "{}";
+            }
+          };
+
+          const push = (index: number, idRaw: any, nameRaw: any, argsRaw: any): void => {
+            const name = typeof nameRaw === "string" ? nameRaw.trim() : "";
+            if (!name) return;
+            const id = typeof idRaw === "string" && idRaw.trim() ? idRaw.trim() : `call_${crypto.randomUUID().replace(/-/g, "")}`;
+            out.push({
+              index,
+              id,
+              type: "function",
+              function: { name, arguments: normalizeArgs(argsRaw) },
+            });
+          };
+
+          const toolCalls = Array.isArray((msg as any).tool_calls) ? (msg as any).tool_calls : [];
+          for (let i = 0; i < toolCalls.length; i++) {
+            const tc = toolCalls[i];
+            if (!tc || typeof tc !== "object") continue;
+
+            // OpenAI chat-completions format: { id, type:"function", function:{ name, arguments } }
+            const fn = tc.function && typeof tc.function === "object" ? tc.function : null;
+            if (fn && typeof fn.name === "string") {
+              push(i, tc.id, fn.name, fn.arguments);
+              continue;
+            }
+
+            // Responses-like format (some gateways): { call_id, name, arguments }
+            if (typeof tc.name === "string") {
+              push(i, tc.call_id ?? tc.id, tc.name, tc.arguments ?? tc.args);
+              continue;
+            }
+          }
+
+          // Legacy OpenAI function_call format: { function_call:{ name, arguments } }
+          const fc = (msg as any).function_call && typeof (msg as any).function_call === "object" ? (msg as any).function_call : null;
+          if (fc && typeof fc.name === "string") {
+            push(0, (msg as any).tool_call_id ?? (msg as any).id, fc.name, fc.arguments);
+          }
+
+          return out;
+        };
+
+        const toolCalls = normalizeChatToolCallsFromChatMessage(msg0);
+        const finishReason = toolCalls.length ? "tool_calls" : finishReason0;
+
+        const content0 = normalizeMessageContent(msg0?.content);
+        if (typeof content0 === "string" && content0) {
+          await writeSse({
+            id,
+            object: "chat.completion.chunk",
+            created,
+            model: outModel,
+            choices: [{ index: 0, delta: { content: content0 }, finish_reason: null }],
+          });
+        }
+
+        if (toolCalls.length) {
+          await writeSse({
+            id,
+            object: "chat.completion.chunk",
+            created,
+            model: outModel,
+            choices: [{ index: 0, delta: { tool_calls: toolCalls }, finish_reason: null }],
+          });
+        }
+
+        // Best-effort: carry through common non-standard fields used by some gateways.
+        const thinking = typeof msg0?.thinking === "string" ? String(msg0.thinking) : "";
+        const reasoningContent = typeof msg0?.reasoning_content === "string" ? String(msg0.reasoning_content) : "";
+        if (thinking || reasoningContent) {
+          const d: any = {};
+          if (thinking) d.thinking = thinking;
+          if (reasoningContent) d.reasoning_content = reasoningContent;
+          await writeSse({
+            id,
+            object: "chat.completion.chunk",
+            created,
+            model: outModel,
+            choices: [{ index: 0, delta: d, finish_reason: null }],
+          });
+        }
+
+        await writeSse({
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model: outModel,
+          choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+          ...(normalizeUsageForChatCompletionsClient(parsed?.usage) ? { usage: normalizeUsageForChatCompletionsClient(parsed?.usage) } : {}),
+        });
+        await writeSse("[DONE]");
+
+        if (debug) {
+          try {
+            const sawXmlToolTags =
+              typeof content0 === "string" &&
+              (content0.includes("<execute_command") ||
+                content0.includes("<read_file") ||
+                content0.includes("<list_directory") ||
+                content0.includes("<function_calls") ||
+                content0.includes("<invoke"));
+            logDebug(debug, reqId, "openai chat-completions non-stream parsed", {
+              upstreamUrl: sel.upstreamUrl,
+              finish_reason: finishReason,
+              toolCallsInMessage: toolCalls.length,
+              sawXmlToolTags,
+            });
+          } catch {}
+        }
+        if (debug) {
+          logDebug(debug, reqId, "openai upstream streaming disabled", {
+            reason: "oai-compatible-copilot user-agent",
+            upstreamUrl: sel.upstreamUrl,
+          });
+          logDebug(debug, reqId, "openai non-stream sse done", { elapsedMs: Date.now() - streamStartedAt });
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err ?? "stream error");
+        if (debug) logDebug(debug, reqId, "openai non-stream sse error", { error: message });
+        try {
+          await writeError(message);
+        } catch {}
+      } finally {
+        try {
+          await writer.close();
+        } catch {}
+      }
+    })();
+
+    return new Response(readable, { status: 200, headers: sseHeaders({ "x-rsp4copilot-upstream-stream": "0", "x-rsp4copilot-early-data": "1" }) });
+  }
+
   const sel = await selectUpstreamResponseAny(upstreamUrls, headers, [body], debug, reqId);
   if (!sel.ok && debug) {
     logDebug(debug, reqId, "openai chat-completions upstream failed", { path, upstreamUrl: sel.upstreamUrl, status: sel.status, error: sel.error });
@@ -3227,89 +3502,6 @@ export async function handleOpenAIChatCompletionsUpstream({
 
   const resp = sel.resp;
   if (stream) {
-    if (!upstreamStream) {
-      const text = await resp.text().catch(() => "");
-      if (!resp.ok || resp.status >= 400) {
-        return new Response(text, {
-          status: resp.status || 500,
-          headers: { "content-type": resp.headers.get("content-type") || "application/json; charset=utf-8" },
-        });
-      }
-      let parsed: any = null;
-      try {
-        parsed = text ? JSON.parse(text) : null;
-      } catch {
-        parsed = null;
-      }
-      if (!parsed || typeof parsed !== "object") {
-        return jsonResponse(502, jsonError("Upstream returned invalid JSON", "bad_gateway"));
-      }
-
-      // Fallback: some OpenAI-compatible relays for Claude-like models ignore tool calling and instead
-      // "describe" the tool invocation in plain text. Convert that into a real `tool_calls` message
-      // so Copilot clients can trigger their confirmation UI.
-      try {
-        const toolsCount = Array.isArray((body as any)?.tools) ? (body as any).tools.length : 0;
-        const choice0 = Array.isArray(parsed?.choices) ? parsed.choices[0] : null;
-        const msg0 = choice0 && typeof choice0 === "object" ? (choice0 as any).message : null;
-        const existingToolCalls = Array.isArray(msg0?.tool_calls) ? msg0.tool_calls : [];
-        if (toolsCount > 0 && msg0 && existingToolCalls.length === 0) {
-          const content0 = normalizeMessageContent(msg0?.content);
-	          const extracted = typeof content0 === "string" ? tryExtractToolCallsFromText(content0) : null;
-	          if (extracted && extracted.length) {
-	            const toolCalls = extracted
-	              .filter((c) => c && typeof c === "object" && typeof c.name === "string" && c.name.trim())
-	              .map((c) => ({
-	                id: `call_${crypto.randomUUID().replace(/-/g, "")}`,
-	                type: "function",
-	                function: {
-	                  name: String(c.name || ""),
-	                  arguments: typeof c.args === "string" ? c.args : JSON.stringify(c.args ?? {}),
-	                },
-	              }));
-	            if (toolCalls.length) {
-	              msg0.tool_calls = toolCalls;
-	              msg0.content = null;
-	              if (choice0 && typeof choice0 === "object") (choice0 as any).finish_reason = "tool_calls";
-	              if (debug) {
-	                logDebug(debug, reqId, "openai tool_calls inferred from text", { toolCalls: toolCalls.map((t) => t.function?.name || "") });
-	              }
-	            }
-	          }
-	        }
-	      } catch {}
-
-      if (debug) {
-        try {
-          const choice0 = Array.isArray(parsed?.choices) ? parsed.choices[0] : null;
-          const msg0 = choice0 && typeof choice0 === "object" ? (choice0 as any).message : null;
-	          const toolCalls0 = Array.isArray(msg0?.tool_calls) ? msg0.tool_calls : [];
-	          const content0 = normalizeMessageContent(msg0?.content);
-	          const sawXmlToolTags =
-	            typeof content0 === "string" &&
-	            (content0.includes("<execute_command") ||
-	              content0.includes("<read_file") ||
-	              content0.includes("<list_directory") ||
-	              content0.includes("<function_calls") ||
-	              content0.includes("<invoke"));
-	          logDebug(debug, reqId, "openai chat-completions non-stream parsed", {
-	            upstreamUrl: sel.upstreamUrl,
-	            finish_reason: typeof choice0?.finish_reason === "string" ? String(choice0.finish_reason) : "",
-	            toolCallsInMessage: toolCalls0.length,
-            sawXmlToolTags,
-          });
-        } catch {}
-      }
-      if (debug) {
-        logDebug(debug, reqId, "openai upstream streaming disabled", {
-          reason: "oai-compatible-copilot user-agent",
-          upstreamUrl: sel.upstreamUrl,
-        });
-      }
-      const readable = buildChatCompletionsSseFromNonStreamJson(parsed, model);
-      return new Response(readable, { status: 200, headers: sseHeaders({ "x-rsp4copilot-upstream-stream": "0" }) });
-    }
-
     return new Response(resp.body, { status: resp.status, headers: sseHeaders() });
   }
 

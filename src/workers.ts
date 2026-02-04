@@ -4433,6 +4433,7 @@ export default {
           hasXApiKey: Boolean(xApiKey),
           xApiKeyLen: typeof xApiKey === "string" ? xApiKey.length : 0,
           contentType: request.headers.get("content-type") || "",
+          accept: request.headers.get("accept") || "",
           contentLength: request.headers.get("content-length") || "",
         });
       }
@@ -4618,6 +4619,19 @@ export default {
           const providerHint = reqJson.provider ?? reqJson.owned_by ?? reqJson.ownedBy ?? reqJson.owner ?? reqJson.vendor;
           const resolved = resolveModel(gatewayCfg.config, model, providerHint, request, reqId);
           if (resolved.ok === false) return withCors(jsonResponse(resolved.status, resolved.error), corsHeaders);
+
+          if (debug) {
+            logDebug(debug, reqId, "model resolved", {
+              requestedModel: model,
+              providerHint: typeof providerHint === "string" ? providerHint : providerHint == null ? "" : String(providerHint),
+              providerId: resolved.provider?.id || "",
+              apiMode: typeof resolved.provider?.apiMode === "string" ? resolved.provider.apiMode : "",
+              modelId: resolved.model?.name || "",
+              upstreamModel: resolved.model?.upstreamModel || "",
+              streamRequested: stream,
+              injectedToolInstructions: Boolean(extraSystemText),
+            });
+          }
 
           reqJson.model = resolved.model.upstreamModel;
           const resp = await dispatchOpenAIChatToProvider({

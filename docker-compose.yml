@@ -21,6 +21,8 @@ services:
       # Set to "true" only if your upstream reliably streams `data:` lines promptly.
       RSP4COPILOT_COPILOT_UPSTREAM_STREAM: "false"
       RSP4COPILOT_DEBUG: "true"
+      # Optional: persist structured debug logs to the mounted /config volume (JSONL).
+      RSP4COPILOT_LOG_FILE: "/config/rsp4copilot.debug.jsonl"
     env_file:
       - .env
     volumes:
