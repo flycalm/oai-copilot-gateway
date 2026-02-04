@@ -871,9 +871,21 @@ const server = createServer(async (req, res) => {
       res.setHeader("cache-control", "no-store");
       res.setHeader("x-content-type-options", "nosniff");
       res.setHeader("connection", "keep-alive");
+      res.setHeader("x-accel-buffering", "no");
       res.setHeader("x-rsp4copilot-early-sse", "1");
       (res as any).flushHeaders?.();
-      res.write(": rsp4copilot\n\n");
+      try {
+        const pingChunk = {
+          id: "",
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: "",
+          choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+        };
+        res.write(`data: ${JSON.stringify(pingChunk)}\n\n`);
+      } catch {
+        res.write(": rsp4copilot\n\n");
+      }
 
       void (async () => {
         try {
