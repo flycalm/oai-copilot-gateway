@@ -175,13 +175,24 @@ function openaiChatToClaudeMessages(messages) {
 
 function openaiToolsToClaude(tools) {
   if (!Array.isArray(tools)) return [];
-  return tools
-    .filter((t) => t.type === "function" && t.function)
-    .map((t) => ({
-      name: t.function.name,
-      description: t.function.description || "",
-      input_schema: t.function.parameters || { type: "object", properties: {} },
-    }));
+  const out: Array<{ name: string; description: string; input_schema: unknown }> = [];
+  for (const t0 of tools) {
+    if (!t0 || typeof t0 !== "object") continue;
+    const t = t0 as any;
+    if (t.type !== "function") continue;
+
+    // OpenAI Chat Completions tools format:
+    //   { type:"function", function:{ name, description?, parameters? } }
+    // OpenAI Responses tools format:
+    //   { type:"function", name, description?, parameters? }
+    const fn = t.function && typeof t.function === "object" ? t.function : t;
+    const name = typeof fn.name === "string" ? fn.name.trim() : "";
+    if (!name) continue;
+    const description = typeof fn.description === "string" ? fn.description : "";
+    const parameters = fn.parameters && typeof fn.parameters === "object" ? fn.parameters : null;
+    out.push({ name, description, input_schema: parameters || { type: "object", properties: {} } });
+  }
+  return out;
 }
 
 function openaiToolChoiceToClaude(toolChoice) {

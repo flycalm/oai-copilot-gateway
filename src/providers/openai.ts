@@ -1599,7 +1599,7 @@ function buildChatCompletionsSseFromNonStreamJson(parsed: any, fallbackModel: st
   });
 }
 
-function tryExtractSingleToolCallFromText(content: string): { name: string; args: unknown } | null {
+function tryExtractToolCallsFromText(content: string): Array<{ name: string; args: unknown }> | null {
   const text = typeof content === "string" ? content.trim() : "";
   if (!text) return null;
 
@@ -1628,7 +1628,7 @@ function tryExtractSingleToolCallFromText(content: string): { name: string; args
   };
 
   const fromFenced = normalize(fencedObj);
-  if (fromFenced) return fromFenced;
+  if (fromFenced) return [fromFenced];
 
   // Best-effort: find a top-level JSON object with "name" and "parameters"/"arguments".
   // Keep this conservative to avoid false positives.
@@ -1638,10 +1638,48 @@ function tryExtractSingleToolCallFromText(content: string): { name: string; args
     if (first >= 0 && last > first) {
       const slice = text.slice(first, last + 1);
       const obj = parseJsonLoose(slice);
-  const fromInline = normalize(obj);
-      if (fromInline) return fromInline;
+      const fromInline = normalize(obj);
+      if (fromInline) return [fromInline];
     }
   }
+
+  // <function_calls> ... <invoke name="tool"><parameter name="k">v</parameter> ... </invoke> ... </function_calls>
+  try {
+    const parseAttr = (attrsRaw: string, key: string): string => {
+      const attrs = String(attrsRaw || "");
+      const re = new RegExp(`${key}\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))`, "i");
+      const m = attrs.match(re);
+      const v = m ? m[1] ?? m[2] ?? m[3] ?? "" : "";
+      return typeof v === "string" ? v.trim() : "";
+    };
+
+    const calls: Array<{ name: string; args: Record<string, unknown> }> = [];
+    const invokeRe = /<invoke\b([^>]*)>([\s\S]*?)<\/invoke>/gi;
+    let im: RegExpExecArray | null = null;
+    while ((im = invokeRe.exec(text))) {
+      const invokeAttrs = im[1] || "";
+      const invokeInner = typeof im[2] === "string" ? im[2] : "";
+      const name = parseAttr(invokeAttrs, "name") || parseAttr(invokeAttrs, "tool") || parseAttr(invokeAttrs, "tool_name");
+      if (!name) continue;
+
+      const args: Record<string, unknown> = {};
+      const paramRe = /<parameter\b([^>]*)>([\s\S]*?)<\/parameter>/gi;
+      let pm: RegExpExecArray | null = null;
+      while ((pm = paramRe.exec(invokeInner))) {
+        const paramAttrs = pm[1] || "";
+        const paramInner = typeof pm[2] === "string" ? pm[2].trim() : "";
+        const k = parseAttr(paramAttrs, "name");
+        if (!k) continue;
+        const v0 = paramInner;
+        if (v0.toLowerCase() === "true") args[k] = true;
+        else if (v0.toLowerCase() === "false") args[k] = false;
+        else args[k] = v0;
+      }
+
+      calls.push({ name, args });
+    }
+    if (calls.length) return calls;
+  } catch {}
 
   // XML-ish tool tags used by some coding agents, e.g.:
   // <execute_command><command>rm -rf ...</command><requires_approval>true</requires_approval></execute_command>
@@ -1663,7 +1701,7 @@ function tryExtractSingleToolCallFromText(content: string): { name: string; args
           else args[k] = v0;
         }
         // If we found at least one parameter tag, treat it as a tool call.
-        if (Object.keys(args).length) return { name: toolName, args };
+        if (Object.keys(args).length) return [{ name: toolName, args }];
       }
     }
   } catch {}
@@ -3217,37 +3255,47 @@ export async function handleOpenAIChatCompletionsUpstream({
         const existingToolCalls = Array.isArray(msg0?.tool_calls) ? msg0.tool_calls : [];
         if (toolsCount > 0 && msg0 && existingToolCalls.length === 0) {
           const content0 = normalizeMessageContent(msg0?.content);
-          const extracted = typeof content0 === "string" ? tryExtractSingleToolCallFromText(content0) : null;
-          if (extracted && extracted.name) {
-            msg0.tool_calls = [
-              {
-                id: `call_${crypto.randomUUID().replace(/-/g, "")}`,
-                type: "function",
-                function: {
-                  name: extracted.name,
-                  arguments: typeof extracted.args === "string" ? extracted.args : JSON.stringify(extracted.args ?? {}),
-                },
-              },
-            ];
-            msg0.content = null;
-            if (choice0 && typeof choice0 === "object") (choice0 as any).finish_reason = "tool_calls";
-            if (debug) logDebug(debug, reqId, "openai tool_calls inferred from text", { name: extracted.name });
-          }
-        }
-      } catch {}
+	          const extracted = typeof content0 === "string" ? tryExtractToolCallsFromText(content0) : null;
+	          if (extracted && extracted.length) {
+	            const toolCalls = extracted
+	              .filter((c) => c && typeof c === "object" && typeof c.name === "string" && c.name.trim())
+	              .map((c) => ({
+	                id: `call_${crypto.randomUUID().replace(/-/g, "")}`,
+	                type: "function",
+	                function: {
+	                  name: String(c.name || ""),
+	                  arguments: typeof c.args === "string" ? c.args : JSON.stringify(c.args ?? {}),
+	                },
+	              }));
+	            if (toolCalls.length) {
+	              msg0.tool_calls = toolCalls;
+	              msg0.content = null;
+	              if (choice0 && typeof choice0 === "object") (choice0 as any).finish_reason = "tool_calls";
+	              if (debug) {
+	                logDebug(debug, reqId, "openai tool_calls inferred from text", { toolCalls: toolCalls.map((t) => t.function?.name || "") });
+	              }
+	            }
+	          }
+	        }
+	      } catch {}
 
       if (debug) {
         try {
           const choice0 = Array.isArray(parsed?.choices) ? parsed.choices[0] : null;
           const msg0 = choice0 && typeof choice0 === "object" ? (choice0 as any).message : null;
-          const toolCalls0 = Array.isArray(msg0?.tool_calls) ? msg0.tool_calls : [];
-          const content0 = normalizeMessageContent(msg0?.content);
-          const sawXmlToolTags =
-            typeof content0 === "string" && (content0.includes("<execute_command") || content0.includes("<read_file") || content0.includes("<list_directory"));
-          logDebug(debug, reqId, "openai chat-completions non-stream parsed", {
-            upstreamUrl: sel.upstreamUrl,
-            finish_reason: typeof choice0?.finish_reason === "string" ? String(choice0.finish_reason) : "",
-            toolCallsInMessage: toolCalls0.length,
+	          const toolCalls0 = Array.isArray(msg0?.tool_calls) ? msg0.tool_calls : [];
+	          const content0 = normalizeMessageContent(msg0?.content);
+	          const sawXmlToolTags =
+	            typeof content0 === "string" &&
+	            (content0.includes("<execute_command") ||
+	              content0.includes("<read_file") ||
+	              content0.includes("<list_directory") ||
+	              content0.includes("<function_calls") ||
+	              content0.includes("<invoke"));
+	          logDebug(debug, reqId, "openai chat-completions non-stream parsed", {
+	            upstreamUrl: sel.upstreamUrl,
+	            finish_reason: typeof choice0?.finish_reason === "string" ? String(choice0.finish_reason) : "",
+	            toolCallsInMessage: toolCalls0.length,
             sawXmlToolTags,
           });
         } catch {}
