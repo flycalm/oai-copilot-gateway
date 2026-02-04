@@ -19,7 +19,7 @@ services:
       # For Copilot clients (oai-compatible-copilot/*): whether to use upstream streaming.
       # Default behavior (when unset) is "false" to avoid some upstreams hanging with an empty SSE.
       # Set to "true" only if your upstream reliably streams `data:` lines promptly.
-      # RSP4COPILOT_COPILOT_UPSTREAM_STREAM: "true"
+      RSP4COPILOT_COPILOT_UPSTREAM_STREAM: "false"
       RSP4COPILOT_DEBUG: "true"
     env_file:
       - .env

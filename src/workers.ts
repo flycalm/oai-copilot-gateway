@@ -150,9 +150,6 @@ function copilotToolUseInstructionsText(): string {
 }
 
 function shouldInjectCopilotToolUseInstructions(request: Request, reqJson: any): boolean {
-  const ua = request.headers.get("user-agent") || "";
-  if (typeof ua !== "string") return false;
-  if (!ua.toLowerCase().includes("oai-compatible-copilot/")) return false;
   const tools = Array.isArray(reqJson?.tools) ? reqJson.tools : [];
   return tools.length > 0;
 }
@@ -4894,6 +4891,7 @@ export default {
         const openaiReq = responsesRequestToOpenAIChat(respReq) as any;
         openaiReq.model = resolved.model.upstreamModel;
         openaiReq.stream = stream;
+        const extraSystemText = shouldInjectCopilotToolUseInstructions(request, openaiReq) ? copilotToolUseInstructionsText() : "";
 
         const openaiResp = await dispatchOpenAIChatToProvider({
           request,
@@ -4908,7 +4906,7 @@ export default {
           reqId,
           path,
           startedAt,
-          extraSystemText: "",
+          extraSystemText,
           ctx,
         });
         if (!openaiResp.ok) return withCors(openaiResp, corsHeaders);

@@ -184,6 +184,32 @@ function openaiToolsToClaude(tools) {
     }));
 }
 
+function openaiToolChoiceToClaude(toolChoice) {
+  if (toolChoice == null) return undefined;
+  if (typeof toolChoice === "string") {
+    const v = toolChoice.trim().toLowerCase();
+    if (v === "auto") return { type: "auto" };
+    if (v === "required") return { type: "any" };
+    if (v === "none") return { type: "none" };
+    return undefined;
+  }
+
+  // OpenAI Chat Completions: { type:"function", function:{ name } }
+  // (Some clients may send: { type:"function", name })
+  if (toolChoice && typeof toolChoice === "object" && (toolChoice as any).type === "function") {
+    const name =
+      (toolChoice as any)?.function?.name ??
+      (toolChoice as any)?.function_name ??
+      (toolChoice as any)?.name ??
+      "";
+    const n = typeof name === "string" ? name.trim() : "";
+    if (!n) return { type: "auto" };
+    return { type: "tool", name: n };
+  }
+
+  return undefined;
+}
+
 function claudeStopReasonToOpenai(stopReason) {
   if (stopReason === "end_turn") return "stop";
   if (stopReason === "tool_use") return "tool_calls";
@@ -295,6 +321,14 @@ export async function handleClaudeChatCompletions({ request, env, reqJson, model
   };
   if (claudeSystem) claudeBody.system = claudeSystem;
   if (claudeTools.length) claudeBody.tools = claudeTools;
+  if (claudeTools.length) {
+    const tc = openaiToolChoiceToClaude(reqJson?.tool_choice);
+    if (tc && tc.type === "none") {
+      delete claudeBody.tools;
+    } else if (tc) {
+      claudeBody.tool_choice = tc;
+    }
+  }
   applyTemperatureTopPFromRequest(reqJson, claudeBody);
 
   const claudeHeaders = applyUpstreamCustomHeaders(
@@ -502,6 +536,9 @@ export async function handleClaudeChatCompletions({ request, env, reqJson, model
               // Accumulate tool call arguments
               if (currentToolIndex >= 0) {
                 toolCallArgs[currentToolIndex] = (toolCallArgs[currentToolIndex] || "") + event.delta.partial_json;
+                const tc = toolCalls[currentToolIndex];
+                const tcId = tc && typeof tc.id === "string" ? tc.id : undefined;
+                const tcName = tc && tc.function && typeof tc.function.name === "string" ? tc.function.name : undefined;
                 // Send argument delta chunk
                 const chunk = {
                   id: chatId,
@@ -515,7 +552,9 @@ export async function handleClaudeChatCompletions({ request, env, reqJson, model
                         tool_calls: [
                           {
                             index: currentToolIndex,
-                            function: { arguments: event.delta.partial_json },
+                            ...(tcId ? { id: tcId } : {}),
+                            type: "function",
+                            function: { ...(tcName ? { name: tcName } : {}), arguments: event.delta.partial_json },
                           },
                         ],
                       },
@@ -531,11 +570,18 @@ export async function handleClaudeChatCompletions({ request, env, reqJson, model
             if (currentToolIndex >= 0 && toolCalls[currentToolIndex]) {
               toolCalls[currentToolIndex].function.arguments = toolCallArgs[currentToolIndex] || "{}";
             }
+            currentToolIndex = -1;
           } else if (event.type === "message_delta" && event.delta?.stop_reason) {
             finishReason = claudeStopReasonToOpenai(event.delta.stop_reason);
+          } else if (event.type === "message_stop") {
+            const stopReason = event?.message?.stop_reason ?? event?.stop_reason;
+            if (stopReason) finishReason = claudeStopReasonToOpenai(stopReason);
           }
         }
       }
+
+      // Some upstreams don't emit `stop_reason` deltas consistently; infer from observed tool calls.
+      if (finishReason === "stop" && toolCalls.length) finishReason = "tool_calls";
 
       // Final chunk with finish_reason
       const usage = claudeUsageToOpenaiUsage(usageObj);

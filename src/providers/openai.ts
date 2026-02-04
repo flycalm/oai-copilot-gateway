@@ -1468,7 +1468,8 @@ function buildChatCompletionsSseFromNonStreamJson(parsed: any, fallbackModel: st
   const encoder = new TextEncoder();
   const created0 = Number(parsed?.created);
   const created = Number.isFinite(created0) ? Math.floor(created0) : Math.floor(Date.now() / 1000);
-  const id = typeof parsed?.id === "string" ? String(parsed.id) : "";
+  const rawId = typeof parsed?.id === "string" ? String(parsed.id).trim() : "";
+  const id = rawId || `chatcmpl_${crypto.randomUUID().replace(/-/g, "")}`;
   const outModel = typeof parsed?.model === "string" ? String(parsed.model) : fallbackModel;
 
   const choice0 = Array.isArray(parsed?.choices) ? parsed.choices[0] : null;
@@ -1596,6 +1597,78 @@ function buildChatCompletionsSseFromNonStreamJson(parsed: any, fallbackModel: st
       controller.close();
     },
   });
+}
+
+function tryExtractSingleToolCallFromText(content: string): { name: string; args: unknown } | null {
+  const text = typeof content === "string" ? content.trim() : "";
+  if (!text) return null;
+
+  const parseJsonLoose = (raw: string): any | null => {
+    const s = String(raw || "").trim();
+    if (!s) return null;
+    try {
+      return JSON.parse(s);
+    } catch {
+      return null;
+    }
+  };
+
+  // Common pattern: a JSON object inside a fenced code block.
+  const fence = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  const fencedBody = fence && typeof fence[1] === "string" ? fence[1] : "";
+  const fencedObj = fencedBody ? parseJsonLoose(fencedBody) : null;
+
+  const normalize = (obj: any): { name: string; args: unknown } | null => {
+    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return null;
+    const nameRaw = obj.name ?? obj.tool ?? obj.tool_name ?? obj.function ?? obj.fn;
+    const name = typeof nameRaw === "string" ? nameRaw.trim() : "";
+    if (!name) return null;
+    const args = obj.arguments ?? obj.args ?? obj.parameters ?? obj.params ?? {};
+    return { name, args };
+  };
+
+  const fromFenced = normalize(fencedObj);
+  if (fromFenced) return fromFenced;
+
+  // Best-effort: find a top-level JSON object with "name" and "parameters"/"arguments".
+  // Keep this conservative to avoid false positives.
+  if (text.includes("{") && (text.includes("\"name\"") || text.includes("'name'"))) {
+    const first = text.indexOf("{");
+    const last = text.lastIndexOf("}");
+    if (first >= 0 && last > first) {
+      const slice = text.slice(first, last + 1);
+      const obj = parseJsonLoose(slice);
+  const fromInline = normalize(obj);
+      if (fromInline) return fromInline;
+    }
+  }
+
+  // XML-ish tool tags used by some coding agents, e.g.:
+  // <execute_command><command>rm -rf ...</command><requires_approval>true</requires_approval></execute_command>
+  try {
+    const outer = text.match(/<([A-Za-z_][\w-]*)>\s*([\s\S]*?)\s*<\/\1>/);
+    if (outer && outer[1]) {
+      const toolName = String(outer[1]).trim();
+      const inner = typeof outer[2] === "string" ? outer[2] : "";
+      if (toolName) {
+        const args: Record<string, unknown> = {};
+        const paramRe = /<([A-Za-z_][\w-]*)>\s*([\s\S]*?)\s*<\/\1>/g;
+        let m: RegExpExecArray | null = null;
+        while ((m = paramRe.exec(inner))) {
+          const k = String(m[1] || "").trim();
+          const v0 = typeof m[2] === "string" ? m[2].trim() : "";
+          if (!k) continue;
+          if (v0.toLowerCase() === "true") args[k] = true;
+          else if (v0.toLowerCase() === "false") args[k] = false;
+          else args[k] = v0;
+        }
+        // If we found at least one parameter tag, treat it as a tool call.
+        if (Object.keys(args).length) return { name: toolName, args };
+      }
+    }
+  } catch {}
+
+  return null;
 }
 
 async function isProbablyEmptyEventStream(resp) {
@@ -3074,6 +3147,17 @@ export async function handleOpenAIChatCompletionsUpstream({
   for (const k of Object.keys(body)) {
     if (k.startsWith("__")) delete body[k];
   }
+  if (debug) {
+    logDebug(debug, reqId, "openai chat-completions request", {
+      model,
+      streamRequested: Boolean(stream),
+      upstreamStream,
+      forceNonStreamUpstream,
+      toolsCount: Array.isArray((body as any)?.tools) ? (body as any).tools.length : 0,
+      toolChoice: (body as any)?.tool_choice ?? null,
+      messagesCount: Array.isArray((body as any)?.messages) ? (body as any).messages.length : 0,
+    });
+  }
 
   const headers = applyUpstreamCustomHeaders(
     {
@@ -3121,6 +3205,52 @@ export async function handleOpenAIChatCompletionsUpstream({
       }
       if (!parsed || typeof parsed !== "object") {
         return jsonResponse(502, jsonError("Upstream returned invalid JSON", "bad_gateway"));
+      }
+
+      // Fallback: some OpenAI-compatible relays for Claude-like models ignore tool calling and instead
+      // "describe" the tool invocation in plain text. Convert that into a real `tool_calls` message
+      // so Copilot clients can trigger their confirmation UI.
+      try {
+        const toolsCount = Array.isArray((body as any)?.tools) ? (body as any).tools.length : 0;
+        const choice0 = Array.isArray(parsed?.choices) ? parsed.choices[0] : null;
+        const msg0 = choice0 && typeof choice0 === "object" ? (choice0 as any).message : null;
+        const existingToolCalls = Array.isArray(msg0?.tool_calls) ? msg0.tool_calls : [];
+        if (toolsCount > 0 && msg0 && existingToolCalls.length === 0) {
+          const content0 = normalizeMessageContent(msg0?.content);
+          const extracted = typeof content0 === "string" ? tryExtractSingleToolCallFromText(content0) : null;
+          if (extracted && extracted.name) {
+            msg0.tool_calls = [
+              {
+                id: `call_${crypto.randomUUID().replace(/-/g, "")}`,
+                type: "function",
+                function: {
+                  name: extracted.name,
+                  arguments: typeof extracted.args === "string" ? extracted.args : JSON.stringify(extracted.args ?? {}),
+                },
+              },
+            ];
+            msg0.content = null;
+            if (choice0 && typeof choice0 === "object") (choice0 as any).finish_reason = "tool_calls";
+            if (debug) logDebug(debug, reqId, "openai tool_calls inferred from text", { name: extracted.name });
+          }
+        }
+      } catch {}
+
+      if (debug) {
+        try {
+          const choice0 = Array.isArray(parsed?.choices) ? parsed.choices[0] : null;
+          const msg0 = choice0 && typeof choice0 === "object" ? (choice0 as any).message : null;
+          const toolCalls0 = Array.isArray(msg0?.tool_calls) ? msg0.tool_calls : [];
+          const content0 = normalizeMessageContent(msg0?.content);
+          const sawXmlToolTags =
+            typeof content0 === "string" && (content0.includes("<execute_command") || content0.includes("<read_file") || content0.includes("<list_directory"));
+          logDebug(debug, reqId, "openai chat-completions non-stream parsed", {
+            upstreamUrl: sel.upstreamUrl,
+            finish_reason: typeof choice0?.finish_reason === "string" ? String(choice0.finish_reason) : "",
+            toolCallsInMessage: toolCalls0.length,
+            sawXmlToolTags,
+          });
+        } catch {}
       }
       if (debug) {
         logDebug(debug, reqId, "openai upstream streaming disabled", {
