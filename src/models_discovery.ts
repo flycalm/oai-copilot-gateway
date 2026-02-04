@@ -1,6 +1,6 @@
 import type { Env } from "./common";
 import { applyUpstreamCustomHeaders, joinPathPrefix, logDebug, normalizeBaseUrl } from "./common";
-import type { GatewayConfig, ProviderConfig } from "./config";
+import { getAnyApiKeyFromConfig, type GatewayConfig, type ProviderConfig } from "./config";
 import { listUpstreamCandidates } from "./upstreams";
 
 function normalizeDuplicateV1Segments(path: unknown): string {
@@ -104,6 +104,48 @@ function shouldDiscoverModels(provider: ProviderConfig): boolean {
   return Boolean((provider as any)?.discoverModels);
 }
 
+export function getModelsDiscoveryWarnings({ env, provider }: { env: Env; provider: ProviderConfig }): string[] {
+  if (!provider || !shouldDiscoverModels(provider)) return [];
+
+  const warnings: string[] = [];
+
+  const apiMode = typeof (provider as any)?.apiMode === "string" ? String((provider as any).apiMode).trim() : "";
+  const apiModeLower = apiMode.toLowerCase();
+  if (apiModeLower && !apiModeLower.startsWith("openai")) {
+    warnings.push(`discoverModels 仅尝试 OpenAI 风格的 GET /v1/models 或 /models（当前 apiMode=${apiMode}）`);
+  }
+
+  const upstreams =
+    Array.isArray((provider as any).upstreams) && (provider as any).upstreams.length
+      ? ((provider as any).upstreams as any[])
+      : [
+          {
+            id: provider.id,
+            baseURLs: Array.isArray((provider as any).baseURLs) ? (provider as any).baseURLs : [],
+            apiKey: (provider as any).apiKey,
+            apiKeyEnv: (provider as any).apiKeyEnv,
+          },
+        ];
+
+  const hasAnyBaseUrl = upstreams.some((u) => Array.isArray(u?.baseURLs) && u.baseURLs.some((x: any) => String(x ?? "").trim()));
+  if (!hasAnyBaseUrl) warnings.push("未配置 baseURL/baseURLs（无法访问上游）");
+
+  const apiKeyEnvNames = Array.from(
+    new Set(
+      upstreams
+        .map((u) => (typeof u?.apiKeyEnv === "string" ? u.apiKeyEnv.trim() : ""))
+        .filter(Boolean),
+    ),
+  );
+  const hasAnyApiKey = upstreams.some((u) => Boolean(getAnyApiKeyFromConfig(env, u)));
+  if (!hasAnyApiKey) {
+    if (apiKeyEnvNames.length) warnings.push(`未检测到可用上游 API key：请检查环境变量 ${apiKeyEnvNames.join(", ")}`);
+    else warnings.push("未检测到可用上游 API key：请配置 apiKey/apiKeyEnv");
+  }
+
+  return warnings;
+}
+
 export async function fetchUpstreamModelsForProvider({
   env,
   provider,
@@ -147,6 +189,14 @@ async function fetchModelsFromUpstream({
 
     for (const baseUrl of baseURLs) {
       const urls = buildModelsListUrls(baseUrl);
+      if (!urls.length) {
+        logDebug(debug, reqId, "models discovery: invalid baseURL or no candidate endpoints", {
+          providerId: provider.id,
+          upstreamId: upstream.id,
+          baseURL: String(baseUrl ?? ""),
+        });
+        continue;
+      }
       for (const endpointUrl of urls) {
         const controller = new AbortController();
         const t = setTimeout(() => controller.abort(), timeoutMs);
@@ -159,6 +209,12 @@ async function fetchModelsFromUpstream({
           const headers = applyUpstreamCustomHeaders(baseHeaders, env);
           const resp = await fetch(endpointUrl, { method: "GET", headers, signal: controller.signal });
           if (!resp.ok) {
+            logDebug(debug, reqId, "models discovery: upstream non-OK response", {
+              providerId: provider.id,
+              upstreamId: upstream.id,
+              url: endpointUrl,
+              status: resp.status,
+            });
             // Try next candidate URL.
             continue;
           }

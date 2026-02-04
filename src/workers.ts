@@ -35,7 +35,7 @@ import { parseGatewayConfig } from "./config";
 import { dispatchOpenAIChatToProvider } from "./dispatch";
 import { resolveModel } from "./model_resolver";
 import { geminiModelsList, ollamaModelsList, openaiModelsList } from "./models_list";
-import { fetchUpstreamModelsForProvider } from "./models_discovery";
+import { fetchUpstreamModelsForProvider, getModelsDiscoveryWarnings } from "./models_discovery";
 import { handleGeminiGenerateContentUpstream } from "./providers/gemini";
 import { handleOpenAIRequest, handleOpenAIResponsesUpstream } from "./providers/openai";
 import { geminiRequestToOpenAIChat, openAIChatResponseToGemini } from "./protocols/gemini";
@@ -3262,18 +3262,20 @@ function webUiHtml(): string {
 	              const useDiscover = Boolean(p.discoverModels);
 	              if (useDiscover) {
 	                try {
-	                  const r = await callGateway('/v1/upstream_models?provider=' + encodeURIComponent(pid), { method: 'GET' });
-	                  if (r.status === 200) {
-	                    let list = [];
-	                    try {
-	                      const json = JSON.parse(r.text || '{}');
-	                      const data = Array.isArray(json && json.data) ? json.data : [];
-	                      list = data.map((x) => safeStr(x && x.id ? x.id : x).trim()).filter(Boolean);
-	                    } catch {}
+		                  const r = await callGateway('/v1/upstream_models?provider=' + encodeURIComponent(pid), { method: 'GET' });
+		                  if (r.status === 200) {
+		                    let list = [];
+		                    let warnings = [];
+		                    try {
+		                      const json = JSON.parse(r.text || '{}');
+		                      const data = Array.isArray(json && json.data) ? json.data : [];
+		                      list = data.map((x) => safeStr(x && x.id ? x.id : x).trim()).filter(Boolean);
+		                      warnings = Array.isArray(json && json.warnings) ? json.warnings.map((x) => safeStr(x).trim()).filter(Boolean) : [];
+		                    } catch {}
 
-	                    if (Array.isArray(list) && list.length) {
-	                      const chosen = await promptSelectModal({
-	                        title: '选择上游模型',
+		                    if (Array.isArray(list) && list.length) {
+		                      const chosen = await promptSelectModal({
+		                        title: '选择上游模型',
 	                        label: '从上游 /v1/models 获取到的候选模型（可搜索过滤）',
 	                        placeholder: '例如 gpt-5.2 / gpt-5.2-codex ...',
 	                        options: list,
@@ -3297,13 +3299,21 @@ function webUiHtml(): string {
 	                      p.models = (p.models && typeof p.models === 'object') ? p.models : {};
 	                      p.models[alias] = { upstreamModel: chosen };
 	                      providers[pid] = p;
-	                      renderProvidersForm();
-	                      return;
-	                    }
-	                  } else {
-	                    // Fallback to manual input when upstream fetch fails or discoverModels is disabled server-side.
-	                    try { alert('拉取上游模型失败：HTTP ' + r.status + '\\n\\n' + (r.text || '')); } catch {}
-	                  }
+		                      renderProvidersForm();
+		                      return;
+		                    }
+
+		                    // 200 but empty list: show a hint then fallback to manual input.
+		                    try {
+		                      let msg = '上游未返回模型列表（data 为空）';
+		                      if (warnings.length) msg += '\\n\\n可能原因：\\n- ' + warnings.join('\\n- ');
+		                      else msg += '\\n\\n请确认：上游支持 GET /v1/models 或 /models，且已配置 apiKeyEnv 并设置对应环境变量，baseURL 也指向正确的 OpenAI 兼容站点。';
+		                      alert(msg);
+		                    } catch {}
+		                  } else {
+		                    // Fallback to manual input when upstream fetch fails or discoverModels is disabled server-side.
+		                    try { alert('拉取上游模型失败：HTTP ' + r.status + '\\n\\n' + (r.text || '')); } catch {}
+		                  }
 	                } catch (err) {
 	                  try { alert('拉取上游模型异常：' + String(err && err.message ? err.message : err)); } catch {}
 	                }
@@ -3702,21 +3712,28 @@ function webUiHtml(): string {
 	            pickBtn.addEventListener('click', async (e) => {
 	              e.preventDefault();
 	              const pid1 = safeStr(b.providerId || '').trim();
-	              if (!pid1) return;
-	              const pp = (root.providers && root.providers[pid1] && typeof root.providers[pid1] === 'object') ? root.providers[pid1] : {};
-	              if (!pp.discoverModels) { alert('该 provider 未开启 discoverModels'); return; }
-	              const r = await callGateway('/v1/upstream_models?provider=' + encodeURIComponent(pid1), { method: 'GET' });
-	              if (r.status !== 200) { alert('拉取上游模型失败：HTTP ' + r.status); return; }
-	              let list = [];
-	              try {
-	                const json = JSON.parse(r.text || '{}');
-	                const data = Array.isArray(json && json.data) ? json.data : [];
-	                list = data.map((x) => safeStr(x && x.id ? x.id : x).trim()).filter(Boolean);
-	              } catch {}
-	              if (!list.length) { alert('上游未返回模型列表'); return; }
-	              const chosen = await promptSelectModal({
-	                title: '选择上游模型',
-	                label: '从上游 /v1/models 获取到的候选模型（可搜索过滤）',
+		              if (!pid1) return;
+		              const pp = (root.providers && root.providers[pid1] && typeof root.providers[pid1] === 'object') ? root.providers[pid1] : {};
+		              if (!pp.discoverModels) { alert('该 provider 未开启 discoverModels'); return; }
+		              const r = await callGateway('/v1/upstream_models?provider=' + encodeURIComponent(pid1), { method: 'GET' });
+		              if (r.status !== 200) { alert('拉取上游模型失败：HTTP ' + r.status + '\\n\\n' + (r.text || '')); return; }
+		              let list = [];
+		              let warnings = [];
+		              try {
+		                const json = JSON.parse(r.text || '{}');
+		                const data = Array.isArray(json && json.data) ? json.data : [];
+		                list = data.map((x) => safeStr(x && x.id ? x.id : x).trim()).filter(Boolean);
+		                warnings = Array.isArray(json && json.warnings) ? json.warnings.map((x) => safeStr(x).trim()).filter(Boolean) : [];
+		              } catch {}
+		              if (!list.length) {
+		                let msg = '上游未返回模型列表';
+		                if (warnings.length) msg += '\\n\\n可能原因：\\n- ' + warnings.join('\\n- ');
+		                alert(msg);
+		                return;
+		              }
+		              const chosen = await promptSelectModal({
+		                title: '选择上游模型',
+		                label: '从上游 /v1/models 获取到的候选模型（可搜索过滤）',
 	                placeholder: '输入以过滤...',
 	                options: list,
 	                okText: '使用该模型',
@@ -4563,16 +4580,18 @@ export default {
           return withCors(jsonResponse(400, jsonError(`Provider ${providerId}: discoverModels is disabled`, "invalid_request_error")), corsHeaders);
         }
 
-        const ownedBy = typeof provider?.ownedBy === "string" && provider.ownedBy.trim() ? provider.ownedBy.trim() : providerId;
-        const ids = await fetchUpstreamModelsForProvider({ env, provider, request, reqId, debug });
-        return withCors(
-          jsonResponse(200, {
-            object: "list",
-            data: ids.map((id) => ({ id, object: "model", created: 0, owned_by: ownedBy })),
-          }),
-          corsHeaders,
-        );
-      }
+	        const ownedBy = typeof provider?.ownedBy === "string" && provider.ownedBy.trim() ? provider.ownedBy.trim() : providerId;
+	        const ids = await fetchUpstreamModelsForProvider({ env, provider, request, reqId, debug });
+	        const warnings = ids.length ? [] : getModelsDiscoveryWarnings({ env, provider });
+	        return withCors(
+	          jsonResponse(200, {
+	            object: "list",
+	            data: ids.map((id) => ({ id, object: "model", created: 0, owned_by: ownedBy })),
+	            ...(warnings.length ? { warnings } : {}),
+	          }),
+	          corsHeaders,
+	        );
+	      }
       if (request.method === "GET" && path === "/gemini/v1beta/models") {
         if (!gatewayCfg.ok || !gatewayCfg.config) {
           return withCors(jsonResponse(500, jsonError(gatewayCfg.error || "Server misconfigured: missing RSP4COPILOT_CONFIG", "server_error")), corsHeaders);

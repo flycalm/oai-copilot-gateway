@@ -59,6 +59,7 @@ Web UI 使用 **HTTP Basic Auth**（浏览器会弹出登录框）：
 注意：
 - 这不会自动把所有上游模型暴露到网关 `/v1/models`
 - 你仍需要在 UI 里选择并添加你要用的模型（写入到配置的 `models` 映射里）
+- 如果候选模型列表为空：请确认 `baseURL/baseURLs` 指向 OpenAI 兼容站点、且 `apiKeyEnv` 对应的环境变量已正确设置（网关需要用该 key 去请求上游的 `/v1/models`）
 
 ---
 
