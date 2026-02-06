@@ -1107,37 +1107,85 @@ function webUiHtml(): string {
     // Tab Navigation
     const navTabs = document.getElementById('navTabs');
     const tabs = navTabs?.querySelectorAll('.nav-tab') || [];
+    const tabStateKey = 'rsp4copilot.activeTab';
+
+    function normalizeTabName(raw){
+      const s = String(raw || '').trim();
+      if (!s) return '';
+      if (s.startsWith('#tab-')) return s.slice(5);
+      if (s.startsWith('#')) return s.slice(1);
+      return s;
+    }
+
+    function getTabButton(name){
+      const tabName = normalizeTabName(name);
+      if (!tabName) return null;
+      return Array.from(tabs).find(t => t.getAttribute('data-tab') === tabName) || null;
+    }
+
+    function setActiveTab(targetTab, opts){
+      const opt = Object.assign({ persist: true, updateHash: true }, opts || {});
+      const tabName = normalizeTabName(targetTab);
+      const tabBtn = getTabButton(tabName);
+      if (!tabName || !tabBtn) return false;
+
+      // Update active nav tab
+      tabs.forEach(t => t.classList.remove('active'));
+      tabBtn.classList.add('active');
+
+      // Show target content, hide others
+      document.querySelectorAll('.tab-content').forEach(content => {
+        content.classList.remove('active', 'fade-in');
+      });
+      const targetContent = document.getElementById('tab-' + tabName);
+      if (targetContent) {
+        targetContent.classList.add('active', 'fade-in');
+      }
+
+      if (opt.persist) {
+        try { localStorage.setItem(tabStateKey, tabName); } catch {}
+      }
+      if (opt.updateHash) {
+        try {
+          if (history && typeof history.replaceState === 'function') {
+            history.replaceState(null, '', '#tab-' + encodeURIComponent(tabName));
+          } else {
+            location.hash = 'tab-' + tabName;
+          }
+        } catch {}
+      }
+
+      // Token/可用率：进入时启动刷新/轮询，离开时停止轮询
+      try {
+        if (tabName === 'tokens') {
+          ensureTokensTab();
+          stopAvailPolling();
+        } else if (tabName === 'availability') {
+          ensureAvailabilityTab();
+          stopTokPolling();
+        } else {
+          stopTokPolling();
+          stopAvailPolling();
+        }
+      } catch {}
+
+      return true;
+    }
+
+    function restoreActiveTab(){
+      const hashTab = normalizeTabName(location && location.hash ? location.hash : '');
+      if (setActiveTab(hashTab, { persist: false, updateHash: false })) return;
+      let savedTab = '';
+      try { savedTab = localStorage.getItem(tabStateKey) || ''; } catch {}
+      if (setActiveTab(savedTab, { persist: false, updateHash: false })) return;
+      setActiveTab('dashboard', { persist: false, updateHash: false });
+    }
+
     tabs.forEach(tab => {
       tab.addEventListener('click', () => {
         const targetTab = tab.getAttribute('data-tab');
         if (!targetTab) return;
-
-        // Update active nav tab
-        tabs.forEach(t => t.classList.remove('active'));
-        tab.classList.add('active');
-
-        // Show target content, hide others
-        document.querySelectorAll('.tab-content').forEach(content => {
-          content.classList.remove('active', 'fade-in');
-        });
-        const targetContent = document.getElementById('tab-' + targetTab);
-        if (targetContent) {
-          targetContent.classList.add('active', 'fade-in');
-        }
-
-        // Token/可用率：进入时启动刷新/轮询，离开时停止轮询
-        try {
-          if (targetTab === 'tokens') {
-            ensureTokensTab();
-            stopAvailPolling();
-          } else if (targetTab === 'availability') {
-            ensureAvailabilityTab();
-            stopTokPolling();
-          } else {
-            stopTokPolling();
-            stopAvailPolling();
-          }
-        } catch {}
+        setActiveTab(targetTab, { persist: true, updateHash: true });
       });
     });
 
@@ -2051,6 +2099,8 @@ function webUiHtml(): string {
 	      keyEl.addEventListener('input', saveKey);
 	      loadKey();
 	    }
+
+    restoreActiveTab();
 
     // Detect whether the Node/Docker UI proxy is available.
     (async () => {
